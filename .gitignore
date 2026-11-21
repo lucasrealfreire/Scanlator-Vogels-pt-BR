@@ -1,0 +1,29 @@
+# Secrets & local environment
+.env
+
+# Python virtual environment
+.venv/
+venv/
+
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local PoC caches, downloaded model weights, and generated outputs
+poc/cache/
+poc/models/
+poc/output/
+*.pt
+*.pth
+*.onnx
+*.safetensors
+
+# Stage 2 extension dependencies & machine-specific native host manifest
+extension/node_modules/
+native_host/com.scanlatorvogels.host.json
+native_host/*.log
+native_host/scanlator_host.exe

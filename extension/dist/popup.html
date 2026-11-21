@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Scanlator Vogels PT-BR</title>
+    <script type="module" crossorigin src="./popup.js"></script>
+    <link rel="stylesheet" crossorigin href="./popup.css">
+  </head>
+  <body>
+    <div class="app">
+      <header class="header">
+        <div>
+          <h1>Scanlator Vogels</h1>
+          <span class="subtitle">PT-BR • Local + Gemini Free Tier (R$ 0,00)</span>
+        </div>
+        <span id="statusBadge" class="badge stopped">Desligado</span>
+      </header>
+
+      <section class="card">
+        <div class="engine-row">
+          <button id="engineBtn" type="button" class="btn btn-start">Ligar Motor</button>
+          <button id="translateNowBtn" type="button" class="btn btn-secondary">
+            Traduzir Página
+          </button>
+        </div>
+        <button id="translateChapterBtn" type="button" class="btn btn-primary">
+          Traduzir Capítulo Inteiro
+        </button>
+        <div id="telemetryGrid" class="telemetry">
+          <div><strong>VRAM:</strong> <span id="vramVal">0 MB</span></div>
+          <div><strong>Cota hoje:</strong> <span id="quotaVal">0 req(s)</span></div>
+          <div><strong>Circuito:</strong> <span id="cbVal">CLOSED</span></div>
+          <div><strong>Auto-off:</strong> <span id="idleVal">—</span></div>
+        </div>
+        <div id="cbBanner" class="banner hidden">
+          <span id="cbBannerText">Circuito aberto por cota/instabilidade.</span>
+          <button id="resetCbBtn" type="button" class="btn btn-warn btn-sm">
+            Testar Retomada
+          </button>
+        </div>
+        <div id="msgBox" class="msg hidden"></div>
+      </section>
+
+      <section class="card">
+        <label class="switch-row">
+          <span>Auto Translate (fila + prefetch 2 págs)</span>
+          <input id="autoTranslate" type="checkbox" />
+        </label>
+        <label class="switch-row">
+          <span>Tipografia em CAIXA ALTA (scanlation)</span>
+          <input id="uppercase" type="checkbox" checked />
+        </label>
+      </section>
+
+      <section class="card form-section">
+        <label class="field">
+          <span>Idioma de Origem do Mangá</span>
+          <select id="sourceLangSelect"></select>
+        </label>
+
+        <label class="field">
+          <span>Modelo Gemini (Whitelist Free Tier)</span>
+          <select id="modelSelect"></select>
+        </label>
+
+        <label class="field">
+          <span>Estilo de Tradução</span>
+          <select id="styleSelect">
+            <option value="scanlation">Scanlation PT-BR (Padrão)</option>
+            <option value="informal">Informal / Coloquial</option>
+            <option value="fiel">Fiel ao Japonês</option>
+            <option value="formal">Formal</option>
+          </select>
+        </label>
+
+        <label class="field">
+          <span>Chave Gemini API (opcional — vazio usa o .env local)</span>
+          <input
+            id="apiKeyInput"
+            type="password"
+            placeholder="Usando GEMINI_API_KEY do .env local"
+            autocomplete="off"
+          />
+        </label>
+
+        <label class="field">
+          <span>Auto-desligamento por inatividade</span>
+          <select id="idleTimeoutSelect">
+            <option value="120">2 minutos</option>
+            <option value="300">5 minutos (Padrão)</option>
+            <option value="600">10 minutos</option>
+            <option value="900">15 minutos</option>
+          </select>
+        </label>
+
+        <div class="footer-actions">
+          <button id="saveBtn" type="button" class="btn btn-primary">Salvar Ajustes</button>
+          <button id="clearCacheBtn" type="button" class="btn btn-ghost">Limpar Cache</button>
+        </div>
+      </section>
+    </div>
+
+  </body>
+</html>

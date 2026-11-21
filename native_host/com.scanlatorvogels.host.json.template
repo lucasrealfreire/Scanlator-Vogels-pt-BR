@@ -1,0 +1,9 @@
+{
+  "name": "com.scanlatorvogels.host",
+  "description": "Scanlator Vogels PT-BR On-Demand Local Engine Controller",
+  "path": "__RUN_HOST_BAT_PATH__",
+  "type": "stdio",
+  "allowed_origins": [
+    "chrome-extension://__EXTENSION_ID__/"
+  ]
+}
