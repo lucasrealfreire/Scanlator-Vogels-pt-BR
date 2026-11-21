@@ -84,62 +84,96 @@ def _pad_to_modulo(arr: np.ndarray, mod: int = 8, is_mask: bool = False) -> tupl
 def _classify_region_background(
     crop_bgr: np.ndarray,
     dilated_mask: np.ndarray,
-) -> tuple[bool, tuple[int, int, int]]:
+) -> tuple[bool, bool, tuple[int, int, int]]:
     """Inspect the pixel ring immediately surrounding the text mask.
 
-    Returns `(is_solid_bubble, median_bgr)` where `is_solid_bubble=True` means
-    the background around the text is flat/uniform (e.g., white speech bubble)
-    and can be cleaned cleanly & instantaneously with OpenCV without LaMa.
+    Returns `(is_solid_bubble, is_smooth_gradient, median_bgr)`:
+    - `is_solid_bubble=True`: uniform flat fill (white, black, colored bubble, or flat RPG
+      system box) — cleaned cleanly with its true sampled `median_bgr` (NEVER hardcoded white!).
+    - `is_smooth_gradient=True`: smooth color gradient without complex lineart — cleaned
+      instantly via OpenCV Telea inpainting preserving the exact gradient with 0 MB VRAM.
+    - Both False: complex textured artwork — deferred to local LaMa crop (or Telea fallback).
     """
     ring_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (17, 17))
     outer = cv2.dilate(dilated_mask, ring_kernel, iterations=1)
     ring = cv2.subtract(outer, dilated_mask)
-    ring_pixels = crop_bgr[ring > 127]
+    ring_ys, ring_xs = np.nonzero(ring > 127)
 
-    if ring_pixels.shape[0] < 20:
-        return False, (255, 255, 255)
+    if ring_ys.size < 20:
+        fallback_med = np.median(crop_bgr.reshape(-1, 3), axis=0)
+        return (
+            False,
+            False,
+            (
+                int(np.clip(round(float(fallback_med[0])), 0, 255)),
+                int(np.clip(round(float(fallback_med[1])), 0, 255)),
+                int(np.clip(round(float(fallback_med[2])), 0, 255)),
+            ),
+        )
 
-    # Compute luminance to filter out thin dark bubble border lines touching the ring
-    lum = (
-        0.114 * ring_pixels[:, 0]
-        + 0.587 * ring_pixels[:, 1]
-        + 0.299 * ring_pixels[:, 2]
-    )
-    # If the majority of the ring is bright (> 200), ignore stray dark ink border pixels
-    bright_ratio = float(np.mean(lum >= 215))
-    if bright_ratio >= 0.72:
-        clean_pixels = ring_pixels[lum >= 200]
+    ring_pixels = crop_bgr[ring_ys, ring_xs]
+    ring_f = ring_pixels.astype(np.float32)
+
+    # Robust dominant-color clustering around the ring median (works identically for
+    # white bubbles, black bubbles, pastel/colored bubbles, and dark RPG system boxes
+    # while ignoring thin contrasting borders touching the ring!)
+    raw_med = np.median(ring_f, axis=0)
+    raw_dists = np.linalg.norm(ring_f - raw_med, axis=1)
+    inlier_mask = raw_dists <= 28.0
+    inlier_ratio = float(np.mean(inlier_mask))
+
+    if int(np.count_nonzero(inlier_mask)) >= 16:
+        clean_pixels = ring_f[inlier_mask]
     else:
-        clean_pixels = ring_pixels
-
-    if clean_pixels.shape[0] < 16:
-        return False, (255, 255, 255)
+        clean_pixels = ring_f
 
     median_bgr = np.median(clean_pixels, axis=0)
-    diffs = np.linalg.norm(clean_pixels.astype(np.float32) - median_bgr.astype(np.float32), axis=1)
-    within_tol = float(np.mean(diffs <= 18.0))
-    std_lum = float(np.std(
-        0.114 * clean_pixels[:, 0]
-        + 0.587 * clean_pixels[:, 1]
-        + 0.299 * clean_pixels[:, 2]
-    ))
+    inlier_dists = np.linalg.norm(clean_pixels - median_bgr, axis=1)
+    within_tol = float(np.mean(inlier_dists <= 18.0))
+    std_color = float(np.sqrt(np.mean(np.var(clean_pixels, axis=0))))
 
-    # Solid white/flat speech bubble criteria:
-    # - Majority of full ring isn't heavily textured/patterned
-    # - Clean pixels have tight uniform color (std < 12, >= 85% within color tolerance)
-    full_diffs = np.linalg.norm(ring_pixels.astype(np.float32) - median_bgr.astype(np.float32), axis=1)
-    full_uniform_ratio = float(np.mean(full_diffs <= 22.0))
+    # Detect color gradients across the ring (top vs bottom, left vs right)
+    gradient_diff = 0.0
+    if ring_ys.size >= 40:
+        mid_y = float(np.median(ring_ys))
+        mid_x = float(np.median(ring_xs))
+        top_px = ring_f[ring_ys <= mid_y]
+        bot_px = ring_f[ring_ys > mid_y]
+        left_px = ring_f[ring_xs <= mid_x]
+        right_px = ring_f[ring_xs > mid_x]
+        if top_px.shape[0] >= 8 and bot_px.shape[0] >= 8:
+            gradient_diff = max(
+                gradient_diff,
+                float(np.linalg.norm(np.median(top_px, axis=0) - np.median(bot_px, axis=0))),
+            )
+        if left_px.shape[0] >= 8 and right_px.shape[0] >= 8:
+            gradient_diff = max(
+                gradient_diff,
+                float(np.linalg.norm(np.median(left_px, axis=0) - np.median(right_px, axis=0))),
+            )
 
     is_solid = (
-        (full_uniform_ratio >= 0.75 and within_tol >= 0.85 and std_lum <= 12.0)
-        or (bright_ratio >= 0.82 and std_lum <= 14.0)
+        inlier_ratio >= 0.72
+        and within_tol >= 0.85
+        and std_color <= 13.0
+        and gradient_diff <= 16.0
     )
+
+    # Smooth gradient check: high spatial color drift, but low local high-frequency edge texture
+    is_smooth_gradient = False
+    if not is_solid and gradient_diff > 16.0:
+        gray_crop = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
+        lap = np.abs(cv2.Laplacian(gray_crop, cv2.CV_32F, ksize=3))
+        ring_edge_energy = float(np.mean(lap[ring_ys, ring_xs]))
+        if ring_edge_energy < 14.0 and std_color <= 26.0:
+            is_smooth_gradient = True
+
     med_tuple = (
         int(np.clip(round(float(median_bgr[0])), 0, 255)),
         int(np.clip(round(float(median_bgr[1])), 0, 255)),
         int(np.clip(round(float(median_bgr[2])), 0, 255)),
     )
-    return is_solid, med_tuple
+    return is_solid, is_smooth_gradient, med_tuple
 
 
 def _extract_block_local_mask(
@@ -174,14 +208,20 @@ def _extract_block_local_mask(
         if pts.shape[0] >= 3:
             cv2.fillPoly(local_mask, [pts], 255)
 
-    # Fallback if neither mask nor lines fired inside bbox: mask dark ink inside tight bbox
+    # Fallback if neither mask nor lines fired inside bbox:
+    # Detect ink contrasting with the crop border (works for dark text on light AND white text on dark/colored!)
     if int(np.count_nonzero(local_mask)) < 16 and bx2 > bx1 and by2 > by1:
         sub_img = img_bgr[
             crop_box.y1 + by1 : crop_box.y1 + by2,
             crop_box.x1 + bx1 : crop_box.x1 + bx2,
-        ]
-        gray = cv2.cvtColor(sub_img, cv2.COLOR_BGR2GRAY)
-        local_mask[by1:by2, bx1:bx2] = np.where(gray < 170, 255, 0).astype(np.uint8)
+        ].astype(np.float32)
+        border_px = np.concatenate(
+            [sub_img[0, :], sub_img[-1, :], sub_img[:, 0], sub_img[:, -1]],
+            axis=0,
+        )
+        bg_med = np.median(border_px, axis=0)
+        color_dist = np.linalg.norm(sub_img - bg_med, axis=2)
+        local_mask[by1:by2, bx1:bx2] = np.where(color_dist > 38.0, 255, 0).astype(np.uint8)
 
     # Slightly dilate to fully erase anti-aliased ink halos around strokes
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
@@ -567,10 +607,13 @@ class HybridInpainter:
                 continue
 
             crop_bgr = cleaned[crop_box.y1 : crop_box.y2, crop_box.x1 : crop_box.x2]
-            is_solid, median_bgr = _classify_region_background(crop_bgr, local_mask)
+            is_solid, is_smooth_gradient, median_bgr = _classify_region_background(
+                crop_bgr, local_mask
+            )
 
-            if is_solid or not force_lama_for_complex:
-                # Fast, spotless OpenCV cleaning for flat/white speech bubbles
+            if is_solid:
+                # Fast, spotless OpenCV cleaning using the TRUE sampled background color
+                # (preserves white, black, pastel/colored bubbles, and dark RPG system boxes!)
                 fill_layer = np.empty_like(crop_bgr)
                 fill_layer[:, :] = median_bgr
                 # Soft 1px feathering on edges for anti-aliased blending
@@ -586,6 +629,23 @@ class HybridInpainter:
 
                 block.inpaint_method = "opencv_solid"
                 block.is_solid_bubble = True
+                block.bubble_bg_rgb = (median_bgr[2], median_bgr[1], median_bgr[0])
+                opencv_count += 1
+            elif is_smooth_gradient or not force_lama_for_complex:
+                # Preserve color gradients / colored system boxes cleanly via local Telea (0 MB VRAM!)
+                inpainted_crop = cv2.inpaint(crop_bgr, local_mask, 5, cv2.INPAINT_TELEA)
+                alpha = cv2.GaussianBlur(local_mask.astype(np.float32) / 255.0, (3, 3), 0)
+                alpha = np.clip(alpha * 1.15, 0.0, 1.0)[..., None]
+                blended = (
+                    inpainted_crop.astype(np.float32) * alpha
+                    + crop_bgr.astype(np.float32) * (1.0 - alpha)
+                )
+                cleaned[crop_box.y1 : crop_box.y2, crop_box.x1 : crop_box.x2] = np.clip(
+                    blended, 0, 255
+                ).astype(np.uint8)
+
+                block.inpaint_method = "opencv_solid"
+                block.is_solid_bubble = False
                 block.bubble_bg_rgb = (median_bgr[2], median_bgr[1], median_bgr[0])
                 opencv_count += 1
             else:

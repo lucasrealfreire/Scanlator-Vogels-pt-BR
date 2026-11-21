@@ -20,7 +20,7 @@ import numpy as np
 
 from poc.cache import PageCache, compute_image_sha256
 from poc.config import OUTPUT_DIR, PoCConfig, ensure_runtime_dirs
-from poc.detector import ComicTextDetector
+from poc.detector import ComicTextDetector, resolve_reading_direction, sort_blocks_reading_order
 from poc.inpainter import HybridInpainter
 from poc.ocr import OCRProvider, create_ocr_provider
 from poc.renderer import (
@@ -28,7 +28,14 @@ from poc.renderer import (
     create_detection_debug_image,
     create_side_by_side_comparison,
 )
-from poc.schemas import BenchmarkReport, QuotaSnapshot, StageMetrics, TextBlock
+from poc.schemas import BenchmarkReport, BoundingBox, QuotaSnapshot, StageMetrics, TextBlock
+from poc.slicer import (
+    compute_vertical_slices,
+    deduplicate_slice_blocks,
+    offset_slice_blocks,
+    should_slice_image,
+    stitch_inpainted_slices,
+)
 from poc.translator import GeminiFreeTierTranslator, TranslatorProvider
 from poc.vram import (
     StageProfiler,
@@ -110,6 +117,7 @@ class ScanlationPipeline:
         skip_translation: bool = False,
         glossary: Optional[dict[str, str]] = None,
         uppercase: bool = True,
+        reading_direction: str = "auto",
     ) -> BenchmarkReport:
         """Run full (or local-only) pipeline on an image, exporting outputs & benchmark."""
         ensure_runtime_dirs()
@@ -153,7 +161,7 @@ class ScanlationPipeline:
                     assert prof.metrics is not None
                     stages.append(prof.metrics)
             else:
-                # Stage 1: Comic Text Detector (load -> detect -> unload!)
+                # Stage 1: Comic Text Detector (load -> detect [sliced if tall strip] -> unload!)
                 with StageProfiler("deteccao") as prof:
                     det_dev_req = resolve_device(
                         self.config.device_preference,
@@ -162,10 +170,27 @@ class ScanlationPipeline:
                     self._detector = ComicTextDetector()
                     used_dev = self._detector.load(det_dev_req)
                     prof.device_used = used_dev
-                    blocks, text_mask = self._detector.detect(image_bgr)
+                    if should_slice_image(img_h, img_w):
+                        regions = compute_vertical_slices(image_bgr)
+                        global_mask = np.zeros((img_h, img_w), dtype=np.uint8)
+                        entries = []
+                        for reg in regions:
+                            sl_blocks, sl_mask = self._detector.detect(image_bgr[reg.y1 : reg.y2, :])
+                            global_mask[reg.y1 : reg.y2, :] = np.maximum(
+                                global_mask[reg.y1 : reg.y2, :], sl_mask
+                            )
+                            for sb in offset_slice_blocks(sl_blocks, reg.y1):
+                                entries.append((sb, reg))
+                        blocks = deduplicate_slice_blocks(entries)
+                        text_mask = global_mask
+                        slices_used = len(regions)
+                    else:
+                        blocks, text_mask = self._detector.detect(image_bgr)
+                        slices_used = 1
                     prof.details = {
                         "detector": self._detector.name,
                         "blocks_detected": len(blocks),
+                        "slices": slices_used,
                     }
                     prof.sample_peak()
                     self._detector.unload()
@@ -173,7 +198,7 @@ class ScanlationPipeline:
                 assert prof.metrics is not None
                 stages.append(prof.metrics)
 
-                # Stage 2: OCR (`manga-ocr`: load -> recognize -> unload!)
+                # Stage 2: OCR (load -> recognize -> resolve reading direction -> unload!)
                 with StageProfiler("ocr") as prof:
                     ocr_dev_req = resolve_device(
                         self.config.device_preference,
@@ -183,9 +208,22 @@ class ScanlationPipeline:
                     used_dev = self._ocr.load(ocr_dev_req)
                     prof.device_used = used_dev
                     blocks = self._ocr.recognize_blocks(image_bgr, blocks)
+                    detected_lang = getattr(self._ocr, "detected_primary_language", self.source_lang)
+                    eff_dir = resolve_reading_direction(
+                        reading_direction,
+                        detected_lang=detected_lang,
+                        blocks=blocks,
+                        img_w=img_w,
+                        img_h=img_h,
+                    )
+                    blocks = sort_blocks_reading_order(
+                        blocks, direction=eff_dir, img_w=img_w, img_h=img_h
+                    )
                     non_empty = sum(1 for b in blocks if b.source_text.strip())
                     prof.details = {
                         "provider": self._ocr.name,
+                        "detected_lang": detected_lang,
+                        "reading_direction": eff_dir,
                         "blocks_recognized": non_empty,
                     }
                     prof.sample_peak()

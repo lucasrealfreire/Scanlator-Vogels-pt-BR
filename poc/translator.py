@@ -218,6 +218,71 @@ def has_glued_words(text: str) -> bool:
     return False
 
 
+_PASSTHROUGH_PUNCT_MAP: tuple[tuple[str, str], ...] = (
+    ("\u2026", "..."),  # …
+    ("\u22ef", "..."),  # ⋯
+    ("\ufe19", "..."),  # ︙
+    ("\u2025", ".."),   # ‥
+    ("\uff01", "!"),    # ！
+    ("\uff1f", "?"),    # ？
+    ("\u203c", "!!"),   # ‼
+    ("\u2049", "!?"),   # ⁉
+    ("\u2048", "?!"),   # ⁈
+    ("\u2014", "-"),    # —
+    ("\u2015", "-"),    # ―
+    ("\u301c", "~"),    # 〜
+    ("\uff5e", "~"),    # ～
+    ("\u3002", "."),    # 。
+    ("\u3001", ","),    # 、
+    ("\u300c", '"'),    # 「
+    ("\u300d", '"'),    # 」
+    ("\u3000", " "),    # ideographic space
+)
+
+
+def is_non_translatable_symbol_text(text: str) -> bool:
+    """Return True if text has NO alphabetic/CJK/Hangul letters (only punctuation/symbols/digits).
+
+    Examples: `…!`, `?!`, `...`, `——`, `!!`, `100%`, `2024`.
+    Such balloons bypass Gemini directly so Flash-Lite never omits them and tokens are saved.
+    """
+    stripped = (text or "").strip()
+    if not stripped:
+        return False
+    return not any(ch.isalpha() for ch in stripped)
+
+
+def normalize_passthrough_symbols(text: str) -> str:
+    """Normalize pure punctuation/symbol/number balloons cleanly for PT-BR rendering."""
+    import unicodedata
+
+    out = (text or "").strip()
+    for src, dst in _PASSTHROUGH_PUNCT_MAP:
+        if src in out:
+            out = out.replace(src, dst)
+    out = unicodedata.normalize("NFKC", out)
+    out = re.sub(r"\.{4,}", "...", out)
+    out = re.sub(r"-{3,}", "--", out)
+    out = re.sub(r"\s+", " ", out).strip()
+    return out
+
+
+def _format_glossary_section(glossary: Optional[dict[str, str]]) -> str:
+    if not glossary:
+        return ""
+    clean_pairs = [
+        (str(k).strip(), str(v).strip())
+        for k, v in glossary.items()
+        if str(k).strip() and str(v).strip()
+    ]
+    if not clean_pairs:
+        return ""
+    lines = ["\nGLOSSÁRIO OBRIGATÓRIO DA OBRA (respeite exatamente nomes/termos/gênero):"]
+    for src, dst in clean_pairs[:120]:
+        lines.append(f"- {src} => {dst}")
+    return "\n".join(lines)
+
+
 def _strip_json_fences(raw: str) -> str:
     text = raw.strip()
     if text.startswith("```"):
@@ -510,6 +575,68 @@ class GeminiFreeTierTranslator(TranslatorProvider):
             logger.warning("Micro-reparo de espacos falhou (%s); mantendo saida.", exc)
             return (0, 0)
 
+    def _micro_fallback_missing_blocks(
+        self,
+        missing_blocks: list[TextBlock],
+        *,
+        source_lang: str,
+        target_lang: str,
+        glossary: Optional[dict[str, str]],
+        system_prompt: str,
+    ) -> tuple[int, int]:
+        """Targeted 1-shot micro-fallback ONLY for IDs omitted by Gemini; never aborts the page."""
+        if not missing_blocks:
+            return (0, 0)
+
+        # Immediately handle any pure-symbol/noise blocks without wasting an API call
+        still_needed: list[TextBlock] = []
+        for blk in missing_blocks:
+            if is_non_translatable_symbol_text(blk.source_text):
+                blk.translated_text = normalize_passthrough_symbols(blk.source_text)
+            else:
+                still_needed.append(blk)
+
+        if not still_needed:
+            return (0, 0)
+
+        payload = {str(b.id): b.source_text.strip() for b in still_needed}
+        glossary_block = _format_glossary_section(glossary)
+        prompt = (
+            f"Traduza SOMENTE estes baloes faltantes ({source_lang} -> {target_lang}).{glossary_block}\n"
+            'Retorne APENAS JSON {"ID": "TRADUCAO"} contendo obrigatoriamente TODAS as chaves:\n'
+            + json.dumps(payload, ensure_ascii=False)
+        )
+        prompt_tok = 0
+        output_tok = 0
+        try:
+            resp = self._call_gemini_json(
+                user_prompt=prompt,
+                system_prompt=system_prompt,
+                temperature=0.2,
+            )
+            raw = (getattr(resp, "text", None) or "").strip()
+            fixed_map = _parse_lean_single_page_json(raw)
+            for blk in still_needed:
+                val = fixed_map.get(blk.id, "").strip()
+                if val:
+                    blk.translated_text = re.sub(r"[ \t]{2,}", " ", val).strip()
+            usage = getattr(resp, "usage_metadata", None)
+            prompt_tok = int(getattr(usage, "prompt_token_count", 0) or 0)
+            output_tok = int(getattr(usage, "candidates_token_count", 0) or 0)
+        except Exception as exc:
+            logger.warning(
+                "Micro-fallback para IDs omitidos %s falhou (%s); preservando original nesses baloes.",
+                [b.id for b in still_needed],
+                exc,
+            )
+
+        # Guarantee NO block is ever left empty or crashes the page!
+        for blk in still_needed:
+            if not blk.translated_text.strip():
+                blk.translated_text = normalize_passthrough_symbols(blk.source_text) or blk.source_text.strip()
+
+        return (prompt_tok, output_tok)
+
     def translate_page(
         self,
         blocks: list[TextBlock],
@@ -519,18 +646,24 @@ class GeminiFreeTierTranslator(TranslatorProvider):
         glossary: Optional[dict[str, str]] = None,
         style: str = "scanlation",
     ) -> tuple[list[TextBlock], Optional[QuotaSnapshot]]:
-        translatable = [b for b in blocks if b.source_text.strip()]
+        translatable: list[TextBlock] = []
+        for b in blocks:
+            raw_src = b.source_text.strip()
+            if not raw_src:
+                continue
+            if is_non_translatable_symbol_text(raw_src):
+                # Bypass Gemini for punctuation/symbol/number-only balloons (e.g. `…!`, `?!`, `——`)
+                b.translated_text = normalize_passthrough_symbols(raw_src)
+                continue
+            translatable.append(b)
+
         if not translatable:
             return blocks, self.quota_tracker.snapshot(self.model)
 
         compact_input = {str(b.id): b.source_text.strip() for b in translatable}
-        glossary_line = (
-            f"\nGlossario obrigatorio: {json.dumps(glossary, ensure_ascii=False)}"
-            if glossary
-            else ""
-        )
+        glossary_section = _format_glossary_section(glossary)
         user_prompt = (
-            f"Idioma origem: {source_lang} -> {target_lang}.{glossary_line}\n"
+            f"Idioma origem: {source_lang} -> {target_lang}.{glossary_section}\n"
             'Retorne APENAS JSON enxuto no formato exato {"1": "FALA", "2": "FALA"} com todas as chaves:\n'
             + json.dumps(compact_input, ensure_ascii=False)
         )
@@ -545,18 +678,32 @@ class GeminiFreeTierTranslator(TranslatorProvider):
         raw_text = (getattr(response, "text", None) or "").strip()
         by_id = _parse_lean_single_page_json(raw_text)
 
-        missing_ids = [b.id for b in translatable if b.id not in by_id or not by_id[b.id]]
-        if missing_ids:
-            raise InvalidJSONResponseError(
-                f"Resposta JSON incompleta do Gemini: faltaram IDs {missing_ids}."
-            )
-
-        for block in translatable:
-            block.translated_text = re.sub(r"[ \t]{2,}", " ", by_id[block.id]).strip()
-
         usage = getattr(response, "usage_metadata", None)
         prompt_tokens = int(getattr(usage, "prompt_token_count", 0) or 0)
         output_tokens = int(getattr(usage, "candidates_token_count", 0) or 0)
+
+        missing_blocks: list[TextBlock] = []
+        for block in translatable:
+            translated = by_id.get(block.id, "").strip()
+            if translated:
+                block.translated_text = re.sub(r"[ \t]{2,}", " ", translated).strip()
+            else:
+                missing_blocks.append(block)
+
+        if missing_blocks:
+            logger.warning(
+                "Gemini omitiu IDs %s na pagina; executando micro-fallback sem abortar a pagina.",
+                [b.id for b in missing_blocks],
+            )
+            fb_in, fb_out = self._micro_fallback_missing_blocks(
+                missing_blocks,
+                source_lang=source_lang,
+                target_lang=target_lang,
+                glossary=glossary,
+                system_prompt=system_prompt,
+            )
+            prompt_tokens += fb_in
+            output_tokens += fb_out
 
         rep_in, rep_out = self._repair_glued_blocks_if_needed(
             translatable,
@@ -584,18 +731,28 @@ class GeminiFreeTierTranslator(TranslatorProvider):
         """Translate up to 4 sequential manga pages in ONE grouped Gemini Free Tier JSON call.
 
         Returns `(pages_blocks, quota_snapshot, fallback_page_indices)` where
-        `fallback_page_indices` lists any page indices that needed a targeted single-page
-        fallback because the batch JSON omitted them (preserving all already-translated pages!).
+        `fallback_page_indices` lists any page indices that needed a targeted fallback
+        because the batch JSON omitted them or some of their IDs (preserving all translated balloons!).
         """
         non_empty_indices: list[int] = []
+        translatable_by_page: dict[int, list[TextBlock]] = {}
         batch_input: dict[str, dict[str, str]] = {}
 
         for idx, blks in enumerate(pages_blocks):
-            translatable = [b for b in blks if b.source_text.strip()]
-            if not translatable:
+            page_translatable: list[TextBlock] = []
+            for b in blks:
+                raw_src = b.source_text.strip()
+                if not raw_src:
+                    continue
+                if is_non_translatable_symbol_text(raw_src):
+                    b.translated_text = normalize_passthrough_symbols(raw_src)
+                    continue
+                page_translatable.append(b)
+            if not page_translatable:
                 continue
             non_empty_indices.append(idx)
-            batch_input[f"p{idx}"] = {str(b.id): b.source_text.strip() for b in translatable}
+            translatable_by_page[idx] = page_translatable
+            batch_input[f"p{idx}"] = {str(b.id): b.source_text.strip() for b in page_translatable}
 
         if not non_empty_indices:
             return pages_blocks, self.quota_tracker.snapshot(self.model), []
@@ -613,19 +770,11 @@ class GeminiFreeTierTranslator(TranslatorProvider):
             )
             return pages_blocks, snap, []
 
-        lang_summary = (
-            ",".join(sorted(set(source_langs)))
-            if source_langs
-            else "ja"
-        )
-        glossary_line = (
-            f"\nGlossario obrigatorio: {json.dumps(glossary, ensure_ascii=False)}"
-            if glossary
-            else ""
-        )
+        lang_summary = ",".join(sorted(set(source_langs))) if source_langs else "ja"
+        glossary_section = _format_glossary_section(glossary)
         user_prompt = (
             f"Lote sequencial de {len(non_empty_indices)} paginas vizinhas do mesmo capitulo "
-            f"(origem: {lang_summary} -> {target_lang}). Mantenha continuidade de dialogo.{glossary_line}\n"
+            f"(origem: {lang_summary} -> {target_lang}). Mantenha continuidade de dialogo.{glossary_section}\n"
             'Retorne APENAS JSON enxuto no formato exato {"p0": {"1": "FALA"}, "p1": {"1": "FALA"}} '
             "preservando todas as paginas e todos os IDs:\n"
             + json.dumps(batch_input, ensure_ascii=False)
@@ -645,25 +794,55 @@ class GeminiFreeTierTranslator(TranslatorProvider):
         prompt_tokens = int(getattr(usage, "prompt_token_count", 0) or 0)
         output_tokens = int(getattr(usage, "candidates_token_count", 0) or 0)
 
-        incomplete_pages: list[int] = []
+        full_fallback_pages: list[int] = []
+        partial_missing_by_page: dict[int, list[TextBlock]] = {}
         all_translated_ok: list[TextBlock] = []
 
         for idx in non_empty_indices:
             pkey = f"p{idx}"
-            translatable = [b for b in pages_blocks[idx] if b.source_text.strip()]
+            translatable = translatable_by_page[idx]
             page_map = parsed_batch.get(pkey) or {}
-            missing = [b.id for b in translatable if b.id not in page_map or not page_map[b.id]]
-            if missing:
+            if not page_map:
                 logger.warning(
-                    "Lote incompleto na pagina %s (faltaram IDs %s); acionando fallback isolado.",
+                    "Lote omitiu pagina inteira %s; acionando fallback isolado.",
                     pkey,
-                    missing,
                 )
-                incomplete_pages.append(idx)
+                full_fallback_pages.append(idx)
                 continue
+
+            page_missing: list[TextBlock] = []
             for b in translatable:
-                b.translated_text = re.sub(r"[ \t]{2,}", " ", page_map[b.id]).strip()
-                all_translated_ok.append(b)
+                val = page_map.get(b.id, "").strip()
+                if val:
+                    b.translated_text = re.sub(r"[ \t]{2,}", " ", val).strip()
+                    all_translated_ok.append(b)
+                else:
+                    page_missing.append(b)
+
+            if page_missing:
+                if len(page_missing) == len(translatable):
+                    full_fallback_pages.append(idx)
+                else:
+                    logger.warning(
+                        "Lote omitiu parcialmente IDs %s na pagina %s; acionando micro-fallback.",
+                        [b.id for b in page_missing],
+                        pkey,
+                    )
+                    partial_missing_by_page[idx] = page_missing
+
+        # Targeted micro-fallback for partially missing IDs (NEVER drops already-translated balloons!)
+        for idx, missing_list in partial_missing_by_page.items():
+            lang = source_langs[idx] if source_langs and idx < len(source_langs) else "ja"
+            fb_in, fb_out = self._micro_fallback_missing_blocks(
+                missing_list,
+                source_lang=lang,
+                target_lang=target_lang,
+                glossary=glossary,
+                system_prompt=system_prompt,
+            )
+            prompt_tokens += fb_in
+            output_tokens += fb_out
+            all_translated_ok.extend(missing_list)
 
         # Micro-repair any glued words across successfully translated batch pages
         rep_in, rep_out = self._repair_glued_blocks_if_needed(
@@ -679,8 +858,8 @@ class GeminiFreeTierTranslator(TranslatorProvider):
             output_tokens=output_tokens,
         )
 
-        # Clean isolated fallback ONLY for incomplete pages (preserving all already-translated pages!)
-        for idx in incomplete_pages:
+        # Clean isolated fallback ONLY for completely omitted pages (preserving all already-translated pages!)
+        for idx in full_fallback_pages:
             lang = source_langs[idx] if source_langs and idx < len(source_langs) else "ja"
             _, quota_snap = self.translate_page(
                 pages_blocks[idx],
@@ -690,7 +869,8 @@ class GeminiFreeTierTranslator(TranslatorProvider):
                 style=style,
             )
 
-        return pages_blocks, quota_snap, incomplete_pages
+        fallback_pages_all = sorted(set(full_fallback_pages) | set(partial_missing_by_page.keys()))
+        return pages_blocks, quota_snap, fallback_pages_all
 
     def list_available_free_models(self) -> list[str]:
         from poc.config import FREE_TIER_MODELS

@@ -128,6 +128,8 @@ class CountingTranslator(TranslatorProvider):
     ) -> tuple[list[TextBlock], Optional[QuotaSnapshot]]:
         def _call():
             self.counter["calls"] += 1
+            self.counter["last_glossary"] = glossary
+            self.counter["last_source_lang"] = source_lang
             if self.fail_with is not None:
                 raise self.fail_with
             for b in blocks:
@@ -470,3 +472,53 @@ def test_translate_batch_groups_multiple_pages_in_one_gemini_call_and_skips_empt
     )
     assert r_paid.status_code == 400
     assert r_paid.json()["code"] == "PAID_MODEL_BLOCKED"
+
+
+def test_direct_ocr_manual_crop_and_glossary_forwarding_and_tall_strip_single_gemini_call(
+    tmp_path: Path,
+) -> None:
+    # 1. Manual crop (`direct_ocr=True`) succeeds even when detector returns 0 blocks!
+    client_empty, _eng, det, ocr, inp, tr_counter, _ = _build_test_client(
+        tmp_path / "crop", empty_detector=True
+    )
+    png = _make_png_bytes(width=240, height=120, seed=77)
+    r_crop = client_empty.post(
+        "/translate-page",
+        json={
+            "image_base64": base64.b64encode(png).decode("ascii"),
+            "direct_ocr": True,
+            "glossary": {"Qi": "Qi", "Sung Jin-Woo": "Sung Jin-Woo"},
+            "reading_direction": "ltr",
+        },
+    )
+    assert r_crop.status_code == 200
+    dc = r_crop.json()
+    assert dc["no_text"] is False
+    assert dc["blocks_count"] == 1
+    assert dc["reading_direction"] == "ltr"
+    assert tr_counter["calls"] == 1
+    assert tr_counter["last_glossary"] == {"Qi": "Qi", "Sung Jin-Woo": "Sung Jin-Woo"}
+
+    # 2. Tall Webtoon strip (800x5200) runs detector per slice, ONE Gemini call for entire strip!
+    client_tall, _eng2, det2, _ocr2, _inp2, tr_counter2, _ = _build_test_client(tmp_path / "tall")
+    tall_img = np.full((5200, 800, 3), 255, dtype=np.uint8)
+    cv2.rectangle(tall_img, (100, 200), (700, 1400), (80, 120, 160), -1)
+    cv2.rectangle(tall_img, (100, 2100), (700, 3300), (120, 80, 160), -1)
+    cv2.rectangle(tall_img, (100, 3900), (700, 4900), (160, 120, 80), -1)
+    ok, tall_buf = cv2.imencode(".jpg", tall_img)
+    assert ok
+
+    r_tall = client_tall.post(
+        "/translate-page",
+        json={
+            "image_base64": base64.b64encode(tall_buf.tobytes()).decode("ascii"),
+            "reading_direction": "auto",
+            "output_format": "webp",
+        },
+    )
+    assert r_tall.status_code == 200
+    dt = r_tall.json()
+    assert dt["slices_count"] >= 3
+    assert dt["reading_direction"] == "ltr"  # Auto resolved tall Webtoon to LTR!
+    assert det2.detect_calls == dt["slices_count"]
+    assert tr_counter2["calls"] == 1  # ONE single Gemini call for ALL slices!

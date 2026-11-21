@@ -11,8 +11,8 @@
     <div class="app">
       <header class="header">
         <div>
-          <h1>Scanlator Vogels</h1>
-          <span class="subtitle">PT-BR • Local + Gemini Free Tier (R$ 0,00)</span>
+          <h1>Scanlator Vogels v1.1</h1>
+          <span class="subtitle">Universal PT-BR • Local + Gemini Free Tier (R$ 0,00)</span>
         </div>
         <span id="statusBadge" class="badge stopped">Desligado</span>
       </header>
@@ -24,9 +24,14 @@
             Traduzir Página
           </button>
         </div>
-        <button id="translateChapterBtn" type="button" class="btn btn-primary">
-          Traduzir Capítulo Inteiro
-        </button>
+        <div class="engine-row">
+          <button id="translateChapterBtn" type="button" class="btn btn-primary">
+            Traduzir Capítulo
+          </button>
+          <button id="manualCropBtn" type="button" class="btn btn-crop" title="Atalho: Alt+S">
+            Recorte (Alt+S)
+          </button>
+        </div>
         <div id="telemetryGrid" class="telemetry">
           <div><strong>VRAM:</strong> <span id="vramVal">0 MB</span></div>
           <div><strong>Cota hoje:</strong> <span id="quotaVal">0 req(s)</span></div>
@@ -44,7 +49,7 @@
 
       <section class="card">
         <label class="switch-row">
-          <span>Auto Translate (fila + prefetch 2 págs)</span>
+          <span>Auto Translate (lotes de 4 págs)</span>
           <input id="autoTranslate" type="checkbox" />
         </label>
         <label class="switch-row">
@@ -54,10 +59,16 @@
       </section>
 
       <section class="card form-section">
-        <label class="field">
-          <span>Idioma de Origem do Mangá</span>
-          <select id="sourceLangSelect"></select>
-        </label>
+        <div class="two-col">
+          <label class="field">
+            <span>Idioma de Origem</span>
+            <select id="sourceLangSelect"></select>
+          </label>
+          <label class="field">
+            <span>Direção de Leitura</span>
+            <select id="readingDirectionSelect"></select>
+          </label>
+        </div>
 
         <label class="field">
           <span>Modelo Gemini (Whitelist Free Tier)</span>
@@ -69,7 +80,7 @@
           <select id="styleSelect">
             <option value="scanlation">Scanlation PT-BR (Padrão)</option>
             <option value="informal">Informal / Coloquial</option>
-            <option value="fiel">Fiel ao Japonês</option>
+            <option value="fiel">Fiel ao Original</option>
             <option value="formal">Formal</option>
           </select>
         </label>
@@ -99,6 +110,36 @@
           <button id="clearCacheBtn" type="button" class="btn btn-ghost">Limpar Cache</button>
         </div>
       </section>
+
+      <details class="card glossary-card" id="glossaryDetails">
+        <summary class="glossary-summary">
+          <span>Glossário da Obra</span>
+          <span id="glossaryCountBadge" class="glossary-badge">0 termos</span>
+        </summary>
+        <div class="glossary-body">
+          <div class="glossary-series-row">
+            <select id="glossarySeriesSelect" title="Obra ativa"></select>
+            <button id="glossaryRenameBtn" type="button" class="btn btn-ghost btn-sm" title="Renomear obra ativa">
+              Renomear
+            </button>
+          </div>
+          <div class="glossary-add-row">
+            <input id="glossarySrcInput" type="text" placeholder="Original (ex: Qi)" />
+            <input id="glossaryDstInput" type="text" placeholder="PT-BR (ex: Qi)" />
+            <button id="glossaryAddBtn" type="button" class="btn btn-primary btn-sm">+</button>
+          </div>
+          <div id="glossaryList" class="glossary-list"></div>
+          <div class="glossary-io-row">
+            <button id="glossaryExportBtn" type="button" class="btn btn-ghost btn-sm">
+              Exportar JSON
+            </button>
+            <button id="glossaryImportBtn" type="button" class="btn btn-ghost btn-sm">
+              Importar JSON
+            </button>
+            <input id="glossaryImportFile" type="file" accept=".json,application/json" class="hidden" />
+          </div>
+        </div>
+      </details>
     </div>
 
   </body>

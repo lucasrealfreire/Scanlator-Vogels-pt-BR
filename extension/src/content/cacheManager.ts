@@ -22,8 +22,12 @@ export interface CachedPageEntry {
   createdAt: number;
 }
 
-export function buildCacheKey(imageUrl: string, settings: ExtensionSettings): string {
-  return `${PROMPT_VERSION}::${imageUrl}::${settings.sourceLang}::${settings.model}::${settings.style}::${settings.uppercase ? "U1" : "U0"}`;
+export function buildCacheKey(
+  imageUrl: string,
+  settings: ExtensionSettings,
+  glossaryHash = "g0"
+): string {
+  return `${PROMPT_VERSION}::${imageUrl}::${settings.sourceLang}::${settings.readingDirection}::${settings.model}::${settings.style}::${settings.uppercase ? "U1" : "U0"}::${glossaryHash}`;
 }
 
 export class CacheManager {

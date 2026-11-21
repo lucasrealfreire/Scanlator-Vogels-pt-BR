@@ -6,10 +6,12 @@
  * - Fetches CORS-restricted comic images using MV3 host_permissions with clear error reporting.
  */
 
+import { loadGlossaryStore, saveGlossaryStore } from "../shared/glossary";
 import { loadSettings, saveSettings } from "../shared/storage";
 import {
   NATIVE_HOST_NAME,
   type BackendHealth,
+  type CaptureTabResponse,
   type EngineActionResponse,
   type EngineLifecycleState,
   type RuntimeMessage,
@@ -297,7 +299,9 @@ async function handleTranslateImage(
   imageUrl: string,
   pageUrl: string,
   providedBase64: string | undefined,
-  forceRetranslate: boolean
+  forceRetranslate: boolean,
+  directOcr: boolean,
+  glossary: Record<string, string> | undefined
 ): Promise<TranslatePageResponse> {
   const settings = await loadSettings();
   const base = backendBase(settings.backendPort);
@@ -324,12 +328,15 @@ async function handleTranslateImage(
         image_base64: imageBase64,
         model: settings.model,
         source_lang: settings.sourceLang,
+        reading_direction: settings.readingDirection,
+        direct_ocr: directOcr,
         style: settings.style,
         uppercase: settings.uppercase,
         output_format: "webp",
         force_retranslate: forceRetranslate,
-        use_cache: true,
+        use_cache: !directOcr,
         api_key: settings.apiKey || undefined,
+        glossary: glossary && Object.keys(glossary).length > 0 ? glossary : undefined,
         idle_timeout_sec: settings.idleTimeoutSec,
       }),
     });
@@ -357,7 +364,8 @@ async function handleTranslateBatch(
     imageUrl: string;
     imageBase64?: string;
     forceRetranslate?: boolean;
-  }>
+  }>,
+  glossary: Record<string, string> | undefined
 ): Promise<TranslateBatchResponse> {
   const settings = await loadSettings();
   const base = backendBase(settings.backendPort);
@@ -405,11 +413,13 @@ async function handleTranslateBatch(
         pages: readyPages,
         model: settings.model,
         source_lang: settings.sourceLang,
+        reading_direction: settings.readingDirection,
         style: settings.style,
         uppercase: settings.uppercase,
         output_format: "webp",
         use_cache: true,
         api_key: settings.apiKey || undefined,
+        glossary: glossary && Object.keys(glossary).length > 0 ? glossary : undefined,
         idle_timeout_sec: settings.idleTimeoutSec,
       }),
     });
@@ -430,6 +440,31 @@ async function handleTranslateBatch(
       ok: false,
       code: "ENGINE_OFFLINE",
       message: "Motor local desligado. Clique em 'Ligar Motor' para traduzir.",
+    };
+  }
+}
+
+async function handleCaptureVisibleTab(windowId: number | undefined): Promise<CaptureTabResponse> {
+  try {
+    const dataUrl = await new Promise<string>((resolve, reject) => {
+      chrome.tabs.captureVisibleTab(windowId ?? chrome.windows.WINDOW_ID_CURRENT, { format: "png" }, (url) => {
+        const err = chrome.runtime.lastError;
+        if (err) {
+          reject(new Error(err.message || "Falha ao capturar aba visivel."));
+          return;
+        }
+        if (!url) {
+          reject(new Error("Captura de tela retornou vazia."));
+          return;
+        }
+        resolve(url);
+      });
+    });
+    return { ok: true, dataUrl };
+  } catch (err) {
+    return {
+      ok: false,
+      message: err instanceof Error ? err.message : String(err),
     };
   }
 }
@@ -458,6 +493,7 @@ async function handlePrepareImage(
       body: JSON.stringify({
         image_base64: imageBase64,
         source_lang: settings.sourceLang,
+        reading_direction: settings.readingDirection,
         use_cache: true,
       }),
     });
@@ -499,7 +535,7 @@ async function handleUpdateIdleTimeout(idleTimeoutSec: number): Promise<Record<s
   }
 }
 
-chrome.runtime.onMessage.addListener((message: RuntimeMessage, _sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((message: RuntimeMessage, sender, sendResponse) => {
   (async () => {
     switch (message.type) {
       case "GET_SETTINGS": {
@@ -524,6 +560,30 @@ chrome.runtime.onMessage.addListener((message: RuntimeMessage, _sender, sendResp
           }
         }
         sendResponse(updated);
+        break;
+      }
+      case "GET_GLOSSARY_STORE": {
+        sendResponse(await loadGlossaryStore());
+        break;
+      }
+      case "SAVE_GLOSSARY_STORE": {
+        const saved = await saveGlossaryStore(message.store);
+        const tabs = await chrome.tabs.query({});
+        for (const t of tabs) {
+          if (t.id !== undefined) {
+            chrome.tabs
+              .sendMessage(t.id, {
+                type: "GLOSSARY_UPDATED",
+                store: saved,
+              } satisfies RuntimeMessage)
+              .catch(() => {});
+          }
+        }
+        sendResponse(saved);
+        break;
+      }
+      case "CAPTURE_VISIBLE_TAB": {
+        sendResponse(await handleCaptureVisibleTab(sender.tab?.windowId));
         break;
       }
       case "ENGINE_STATUS": {
@@ -552,13 +612,15 @@ chrome.runtime.onMessage.addListener((message: RuntimeMessage, _sender, sendResp
             message.imageUrl,
             message.pageUrl,
             message.imageBase64,
-            Boolean(message.forceRetranslate)
+            Boolean(message.forceRetranslate),
+            Boolean(message.directOcr),
+            message.glossary
           )
         );
         break;
       }
       case "TRANSLATE_BATCH_URLS": {
-        sendResponse(await handleTranslateBatch(message.pageUrl, message.items));
+        sendResponse(await handleTranslateBatch(message.pageUrl, message.items, message.glossary));
         break;
       }
       case "PREPARE_IMAGE_URL": {

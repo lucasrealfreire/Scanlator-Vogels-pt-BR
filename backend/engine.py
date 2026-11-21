@@ -38,11 +38,22 @@ from poc.config import (
     ensure_runtime_dirs,
     validate_free_tier_model,
 )
-from poc.detector import ComicTextDetector
+from poc.detector import (
+    ComicTextDetector,
+    resolve_reading_direction,
+    sort_blocks_reading_order,
+)
 from poc.inpainter import HybridInpainter
 from poc.ocr import OCRProvider, create_ocr_provider
 from poc.renderer import MangaTextRenderer, encode_pil_image_fast
-from poc.schemas import QuotaSnapshot, TextBlock
+from poc.schemas import BoundingBox, QuotaSnapshot, TextBlock
+from poc.slicer import (
+    compute_vertical_slices,
+    deduplicate_slice_blocks,
+    offset_slice_blocks,
+    should_slice_image,
+    stitch_inpainted_slices,
+)
 from poc.translator import (
     PROMPT_VERSION,
     GeminiFreeTierTranslator,
@@ -59,7 +70,8 @@ from poc.vram import (
 
 logger = logging.getLogger(__name__)
 
-SUPPORTED_SOURCE_LANGUAGES: tuple[str, ...] = ("auto", "ja", "en", "ko", "zh")
+SUPPORTED_SOURCE_LANGUAGES: tuple[str, ...] = ("auto", "ja", "ko", "zh", "en", "es", "fr")
+SUPPORTED_READING_DIRECTIONS: tuple[str, ...] = ("auto", "rtl", "ltr")
 MAX_BATCH_PAGES: int = 4
 
 
@@ -87,6 +99,8 @@ class PageTranslationOutput:
     blocks: list[TextBlock] = field(default_factory=list)
     page_id: str = ""
     used_fallback: bool = False
+    reading_direction: str = "rtl"
+    slices_count: int = 1
 
 
 @dataclass
@@ -143,7 +157,18 @@ def normalize_source_lang(lang: Optional[str]) -> str:
     cleaned = (lang or "auto").strip().lower()
     if cleaned in {"jp", "jpn"}:
         return "ja"
+    if cleaned in {"kr", "kor"}:
+        return "ko"
+    if cleaned in {"cn", "zh-cn", "zh-tw", "zh_tw", "zh_cn"}:
+        return "zh"
     if cleaned in SUPPORTED_SOURCE_LANGUAGES:
+        return cleaned
+    return "auto"
+
+
+def normalize_reading_direction(direction: Optional[str]) -> str:
+    cleaned = (direction or "auto").strip().lower()
+    if cleaned in SUPPORTED_READING_DIRECTIONS:
         return cleaned
     return "auto"
 
@@ -386,6 +411,8 @@ class WarmScanlationEngine:
         image_sha: str,
         source_lang: str,
         *,
+        reading_direction: str = "auto",
+        direct_ocr: bool = False,
         use_cache: bool,
         force_retranslate: bool,
     ) -> tuple[
@@ -394,108 +421,370 @@ class WarmScanlationEngine:
         list[TextBlock],
         Optional[np.ndarray],
         str,
+        str,
+        int,
         dict[str, str],
         dict[str, float],
     ]:
+        img_h, img_w = image_bgr.shape[:2]
         cache_key = self._cache_key(image_sha, source_lang)
         page_cache = PageCache(cache_key, base_dir=self.cache_dir)
         timings = {"deteccao": 0.0, "ocr": 0.0, "inpainting": 0.0}
         devices = {"deteccao": "cache", "ocr": "cache", "inpainting": "cache"}
         detected_lang = "ja" if source_lang == "auto" else source_lang
+        slices_count = 1
+        effective_use_cache = use_cache and not direct_ocr
 
         with self._gpu_lock:
             self.touch_activity()
 
-            if use_cache and not force_retranslate and self._has_negative_cache(cache_key):
-                return True, True, [], None, detected_lang, devices, timings
+            if effective_use_cache and not force_retranslate and self._has_negative_cache(cache_key):
+                eff_dir = resolve_reading_direction(
+                    reading_direction, detected_lang=detected_lang, img_w=img_w, img_h=img_h
+                )
+                return True, True, [], None, detected_lang, eff_dir, 1, devices, timings
 
-            cached_det_ocr = page_cache.load_detection_and_ocr() if use_cache else None
+            cached_det_ocr = page_cache.load_detection_and_ocr() if effective_use_cache else None
             cache_hit_local = False
 
             if cached_det_ocr is not None:
                 blocks, text_mask = cached_det_ocr
                 cache_hit_local = True
                 all_txt = " ".join(b.source_text for b in blocks)
-                lat_n = sum(1 for c in all_txt if "a" <= c.lower() <= "z")
-                cjk_n = sum(1 for c in all_txt if "\u3040" <= c <= "\u9fff" or "\uac00" <= c <= "\ud7af")
-                detected_lang = "en" if lat_n > cjk_n else (source_lang if source_lang != "auto" else "ja")
-            else:
-                t0 = time.perf_counter()
+                if source_lang != "auto":
+                    detected_lang = source_lang
+                else:
+                    kana_n = sum(1 for c in all_txt if "\u3040" <= c <= "\u30ff")
+                    hangul_n = sum(1 for c in all_txt if "\uac00" <= c <= "\ud7af")
+                    hanzi_n = sum(1 for c in all_txt if "\u4e00" <= c <= "\u9fff")
+                    lat_n = sum(1 for c in all_txt if "a" <= c.lower() <= "z")
+                    if hangul_n >= 2:
+                        detected_lang = "ko"
+                    elif kana_n >= 1:
+                        detected_lang = "ja"
+                    elif hanzi_n >= 2 and hanzi_n >= lat_n:
+                        detected_lang = "zh"
+                    elif lat_n > hanzi_n:
+                        detected_lang = "en"
+                    else:
+                        detected_lang = "ja"
+                eff_dir = resolve_reading_direction(
+                    reading_direction,
+                    detected_lang=detected_lang,
+                    blocks=blocks,
+                    img_w=img_w,
+                    img_h=img_h,
+                )
+                blocks = sort_blocks_reading_order(
+                    blocks, direction=eff_dir, img_w=img_w, img_h=img_h
+                )
+                cached_inpainted = page_cache.load_inpainted(blocks) if effective_use_cache else None
+                if cached_inpainted is not None:
+                    inpainted_bgr = cached_inpainted
+                else:
+                    t2 = time.perf_counter()
+                    inpainter = self._ensure_inpainter()
+                    inp_dev_req = resolve_device(
+                        self.config.device_preference,
+                        min_free_vram_mb=self.config.min_free_vram_mb,
+                    )
+                    inpainted_bgr, dev_inp, _ = inpainter.inpaint_page(
+                        image_bgr,
+                        text_mask,
+                        blocks,
+                        device=inp_dev_req,
+                    )
+                    timings["inpainting"] = round((time.perf_counter() - t2) * 1000.0, 2)
+                    devices["inpainting"] = dev_inp
+                    if effective_use_cache:
+                        page_cache.save_inpainted(inpainted_bgr, blocks)
+                return (
+                    False,
+                    cache_hit_local,
+                    blocks,
+                    inpainted_bgr,
+                    detected_lang,
+                    eff_dir,
+                    1,
+                    devices,
+                    timings,
+                )
+
+            # Determine whether this is a tall Webtoon/Manhwa strip requiring smart vertical slicing
+            use_slicer = (not direct_ocr) and should_slice_image(img_h, img_w)
+            if use_slicer:
+                regions = compute_vertical_slices(image_bgr)
+                slices_count = len(regions)
+                logger.info(
+                    "Tira longa detectada (%dx%d): fatiando em %d fatias seguras.",
+                    img_w,
+                    img_h,
+                    slices_count,
+                )
+                t_det0 = time.perf_counter()
                 detector, dev_det = self._ensure_detector_loaded()
-                blocks, text_mask = detector.detect(image_bgr)
-                timings["deteccao"] = round((time.perf_counter() - t0) * 1000.0, 2)
+                global_mask = np.zeros((img_h, img_w), dtype=np.uint8)
+                slice_entries: list[tuple[TextBlock, Any]] = []
+                slice_local_blocks: list[list[TextBlock]] = []
+                slice_local_masks: list[np.ndarray] = []
+
+                for reg in regions:
+                    sl_bgr = image_bgr[reg.y1 : reg.y2, :]
+                    sl_blocks, sl_mask = detector.detect(sl_bgr)
+                    slice_local_blocks.append(sl_blocks)
+                    slice_local_masks.append(sl_mask)
+                    global_mask[reg.y1 : reg.y2, :] = np.maximum(
+                        global_mask[reg.y1 : reg.y2, :], sl_mask
+                    )
+                    shifted = offset_slice_blocks(sl_blocks, reg.y1)
+                    for sb in shifted:
+                        slice_entries.append((sb, reg))
+
+                blocks = deduplicate_slice_blocks(slice_entries)
+                text_mask = global_mask
+                timings["deteccao"] = round((time.perf_counter() - t_det0) * 1000.0, 2)
                 devices["deteccao"] = dev_det
 
                 if not blocks:
-                    if use_cache:
+                    if effective_use_cache:
                         self._save_negative_cache(cache_key, "zero_blocks_detected")
                     devices["ocr"] = "skipped"
                     devices["inpainting"] = "skipped"
-                    return True, False, [], None, detected_lang, devices, timings
+                    eff_dir = resolve_reading_direction(
+                        reading_direction, detected_lang=detected_lang, img_w=img_w, img_h=img_h
+                    )
+                    return True, False, [], None, detected_lang, eff_dir, slices_count, devices, timings
 
-                t1 = time.perf_counter()
+                # Run OCR across unified deduplicated blocks directly from full strip
+                t_ocr0 = time.perf_counter()
                 ocr, dev_ocr = self._ensure_ocr_loaded(source_lang)
                 blocks = ocr.recognize_blocks(image_bgr, blocks)
-                timings["ocr"] = round((time.perf_counter() - t1) * 1000.0, 2)
+                timings["ocr"] = round((time.perf_counter() - t_ocr0) * 1000.0, 2)
                 devices["ocr"] = dev_ocr
                 detected_lang = getattr(ocr, "detected_primary_language", detected_lang)
 
+                eff_dir = resolve_reading_direction(
+                    reading_direction,
+                    detected_lang=detected_lang,
+                    blocks=blocks,
+                    img_w=img_w,
+                    img_h=img_h,
+                )
+                blocks = sort_blocks_reading_order(
+                    blocks, direction=eff_dir, img_w=img_w, img_h=img_h
+                )
+
                 if not any(b.source_text.strip() for b in blocks):
-                    if use_cache:
+                    if effective_use_cache:
                         self._save_negative_cache(cache_key, "ocr_empty")
                     devices["inpainting"] = "skipped"
-                    return True, False, blocks, None, detected_lang, devices, timings
+                    return True, False, blocks, None, detected_lang, eff_dir, slices_count, devices, timings
 
-                if use_cache:
+                # Run inpainting per slice and seamlessly stitch back to full height
+                t_inp0 = time.perf_counter()
+                inpainter = self._ensure_inpainter()
+                inp_dev_req = resolve_device(
+                    self.config.device_preference,
+                    min_free_vram_mb=self.config.min_free_vram_mb,
+                )
+                cleaned_slices: list[np.ndarray] = []
+                dev_inp = "cpu"
+                for reg, sl_mask in zip(regions, slice_local_masks):
+                    sl_bgr = image_bgr[reg.y1 : reg.y2, :]
+                    # Select unified blocks whose center falls inside this slice's window
+                    sl_blks_local: list[TextBlock] = []
+                    sl_blks_refs: list[TextBlock] = []
+                    for blk in blocks:
+                        if blk.bbox.y2 > reg.y1 and blk.bbox.y1 < reg.y2:
+                            lb = blk.model_copy(deep=True)
+                            lb.bbox = BoundingBox(
+                                x1=blk.bbox.x1,
+                                y1=max(0, blk.bbox.y1 - reg.y1),
+                                x2=blk.bbox.x2,
+                                y2=min(reg.height, blk.bbox.y2 - reg.y1),
+                            )
+                            lb.lines = [
+                                [
+                                    [pt[0], max(0, min(reg.height - 1, pt[1] - reg.y1))]
+                                    for pt in poly
+                                ]
+                                for poly in blk.lines
+                            ]
+                            sl_blks_local.append(lb)
+                            sl_blks_refs.append(blk)
+
+                    if sl_blks_local:
+                        sl_clean, dev_inp, _ = inpainter.inpaint_page(
+                            sl_bgr, sl_mask, sl_blks_local, device=inp_dev_req
+                        )
+                        # Copy inpaint metadata back onto unified blocks owned by this slice
+                        for lb, orig_b in zip(sl_blks_local, sl_blks_refs):
+                            if reg.paste_y1 <= orig_b.bbox.cy < reg.paste_y2:
+                                orig_b.inpaint_method = lb.inpaint_method
+                                orig_b.is_solid_bubble = lb.is_solid_bubble
+                                orig_b.bubble_bg_rgb = lb.bubble_bg_rgb
+                                if lb.render_bbox is not None:
+                                    orig_b.render_bbox = BoundingBox(
+                                        x1=lb.render_bbox.x1,
+                                        y1=lb.render_bbox.y1 + reg.y1,
+                                        x2=lb.render_bbox.x2,
+                                        y2=lb.render_bbox.y2 + reg.y1,
+                                    ).clamped(img_w, img_h)
+                        cleaned_slices.append(sl_clean)
+                    else:
+                        cleaned_slices.append(sl_bgr.copy())
+
+                inpainted_bgr = stitch_inpainted_slices(cleaned_slices, regions, img_h, img_w)
+                timings["inpainting"] = round((time.perf_counter() - t_inp0) * 1000.0, 2)
+                devices["inpainting"] = dev_inp
+
+                if effective_use_cache:
                     page_cache.save_detection_and_ocr(
                         blocks,
                         text_mask,
                         detector_name=getattr(detector, "name", "comic-text-detector-onnx"),
                         ocr_name=f"{ocr.name} ({source_lang}->{detected_lang})",
                     )
-
-            cached_inpainted = page_cache.load_inpainted(blocks) if use_cache else None
-            if cached_inpainted is not None:
-                inpainted_bgr = cached_inpainted
-            else:
-                t2 = time.perf_counter()
-                inpainter = self._ensure_inpainter()
-                inp_dev_req = resolve_device(
-                    self.config.device_preference,
-                    min_free_vram_mb=self.config.min_free_vram_mb,
-                )
-                inpainted_bgr, dev_inp, _ = inpainter.inpaint_page(
-                    image_bgr,
-                    text_mask,
-                    blocks,
-                    device=inp_dev_req,
-                )
-                timings["inpainting"] = round((time.perf_counter() - t2) * 1000.0, 2)
-                devices["inpainting"] = dev_inp
-                if use_cache:
                     page_cache.save_inpainted(inpainted_bgr, blocks)
 
-            return False, cache_hit_local, blocks, inpainted_bgr, detected_lang, devices, timings
+                return (
+                    False,
+                    False,
+                    blocks,
+                    inpainted_bgr,
+                    detected_lang,
+                    eff_dir,
+                    slices_count,
+                    devices,
+                    timings,
+                )
+
+            # Standard single-pass page (or manual screenshot crop with `direct_ocr=True`)
+            t0 = time.perf_counter()
+            detector, dev_det = self._ensure_detector_loaded()
+            blocks, text_mask = detector.detect(image_bgr)
+            timings["deteccao"] = round((time.perf_counter() - t0) * 1000.0, 2)
+            devices["deteccao"] = dev_det
+
+            if not blocks and direct_ocr and img_w >= 16 and img_h >= 16:
+                pad = min(4, max(0, min(img_w, img_h) // 20))
+                blocks = [
+                    TextBlock(
+                        id=1,
+                        bbox=BoundingBox(x1=pad, y1=pad, x2=img_w - pad, y2=img_h - pad),
+                        is_vertical=(img_h > int(img_w * 1.4)),
+                        confidence=1.0,
+                    )
+                ]
+
+            if not blocks:
+                if effective_use_cache:
+                    self._save_negative_cache(cache_key, "zero_blocks_detected")
+                devices["ocr"] = "skipped"
+                devices["inpainting"] = "skipped"
+                eff_dir = resolve_reading_direction(
+                    reading_direction, detected_lang=detected_lang, img_w=img_w, img_h=img_h
+                )
+                return True, False, [], None, detected_lang, eff_dir, 1, devices, timings
+
+            t1 = time.perf_counter()
+            ocr, dev_ocr = self._ensure_ocr_loaded(source_lang)
+            blocks = ocr.recognize_blocks(image_bgr, blocks)
+            detected_lang = getattr(ocr, "detected_primary_language", detected_lang)
+
+            # If manual screenshot crop still returned empty on sub-blocks, force full-crop direct OCR!
+            if direct_ocr and not any(b.source_text.strip() for b in blocks):
+                pad = min(4, max(0, min(img_w, img_h) // 20))
+                full_blk = TextBlock(
+                    id=1,
+                    bbox=BoundingBox(x1=pad, y1=pad, x2=img_w - pad, y2=img_h - pad),
+                    is_vertical=(img_h > int(img_w * 1.4)),
+                    confidence=1.0,
+                )
+                blocks = ocr.recognize_blocks(image_bgr, [full_blk])
+                detected_lang = getattr(ocr, "detected_primary_language", detected_lang)
+
+            timings["ocr"] = round((time.perf_counter() - t1) * 1000.0, 2)
+            devices["ocr"] = dev_ocr
+
+            eff_dir = resolve_reading_direction(
+                reading_direction,
+                detected_lang=detected_lang,
+                blocks=blocks,
+                img_w=img_w,
+                img_h=img_h,
+            )
+            blocks = sort_blocks_reading_order(
+                blocks, direction=eff_dir, img_w=img_w, img_h=img_h
+            )
+
+            if not any(b.source_text.strip() for b in blocks):
+                if effective_use_cache:
+                    self._save_negative_cache(cache_key, "ocr_empty")
+                devices["inpainting"] = "skipped"
+                return True, False, blocks, None, detected_lang, eff_dir, 1, devices, timings
+
+            if effective_use_cache:
+                page_cache.save_detection_and_ocr(
+                    blocks,
+                    text_mask,
+                    detector_name=getattr(detector, "name", "comic-text-detector-onnx"),
+                    ocr_name=f"{ocr.name} ({source_lang}->{detected_lang})",
+                )
+
+            t2 = time.perf_counter()
+            inpainter = self._ensure_inpainter()
+            inp_dev_req = resolve_device(
+                self.config.device_preference,
+                min_free_vram_mb=self.config.min_free_vram_mb,
+            )
+            inpainted_bgr, dev_inp, _ = inpainter.inpaint_page(
+                image_bgr,
+                text_mask,
+                blocks,
+                device=inp_dev_req,
+            )
+            timings["inpainting"] = round((time.perf_counter() - t2) * 1000.0, 2)
+            devices["inpainting"] = dev_inp
+            if effective_use_cache:
+                page_cache.save_inpainted(inpainted_bgr, blocks)
+
+            return (
+                False,
+                False,
+                blocks,
+                inpainted_bgr,
+                detected_lang,
+                eff_dir,
+                1,
+                devices,
+                timings,
+            )
 
     def prepare_image_bytes(
         self,
         raw_bytes: bytes,
         *,
         source_lang: Optional[str] = None,
+        reading_direction: str = "auto",
         use_cache: bool = True,
     ) -> PagePrepareOutput:
         self.touch_activity()
         lang = normalize_source_lang(source_lang or self.default_source_lang)
+        rdir = normalize_reading_direction(reading_direction)
         image_bgr = decode_image_bytes_bgr(raw_bytes)
         image_sha = hashlib.sha256(raw_bytes).hexdigest()
 
         t_start = time.perf_counter()
-        no_text, cache_hit, blocks, _inp, det_lang, _devs, timings = self._run_local_vision_stages(
-            image_bgr,
-            image_sha,
-            lang,
-            use_cache=use_cache,
-            force_retranslate=False,
+        no_text, cache_hit, blocks, _inp, det_lang, _eff_dir, _slices, _devs, timings = (
+            self._run_local_vision_stages(
+                image_bgr,
+                image_sha,
+                lang,
+                reading_direction=rdir,
+                use_cache=use_cache,
+                force_retranslate=False,
+            )
         )
         timings["total"] = round((time.perf_counter() - t_start) * 1000.0, 2)
         self.touch_activity()
@@ -515,6 +804,8 @@ class WarmScanlationEngine:
         *,
         model: Optional[str] = None,
         source_lang: Optional[str] = None,
+        reading_direction: str = "auto",
+        direct_ocr: bool = False,
         style: str = "scanlation",
         uppercase: bool = True,
         output_format: str = "webp",
@@ -526,6 +817,7 @@ class WarmScanlationEngine:
         self.touch_activity()
         chosen_model = validate_free_tier_model(model or self.config.gemini_model)
         chosen_lang = normalize_source_lang(source_lang or self.default_source_lang)
+        chosen_dir = normalize_reading_direction(reading_direction)
         chosen_style = (style or "scanlation").strip().lower()
         if chosen_style not in {"scanlation", "informal", "fiel", "formal"}:
             chosen_style = "scanlation"
@@ -535,14 +827,24 @@ class WarmScanlationEngine:
         image_sha = hashlib.sha256(raw_bytes).hexdigest()
         t_total_start = time.perf_counter()
 
-        no_text, cache_hit_local, blocks, inpainted_bgr, detected_lang, devices, local_timings = (
-            self._run_local_vision_stages(
-                image_bgr,
-                image_sha,
-                chosen_lang,
-                use_cache=use_cache,
-                force_retranslate=force_retranslate,
-            )
+        (
+            no_text,
+            cache_hit_local,
+            blocks,
+            inpainted_bgr,
+            detected_lang,
+            effective_dir,
+            slices_count,
+            devices,
+            local_timings,
+        ) = self._run_local_vision_stages(
+            image_bgr,
+            image_sha,
+            chosen_lang,
+            reading_direction=chosen_dir,
+            direct_ocr=direct_ocr,
+            use_cache=use_cache,
+            force_retranslate=force_retranslate,
         )
 
         timings: dict[str, float] = {
@@ -580,6 +882,8 @@ class WarmScanlationEngine:
                 timings_ms=timings,
                 quota=self.quota_tracker.snapshot(chosen_model),
                 blocks=blocks,
+                reading_direction=effective_dir,
+                slices_count=slices_count,
             )
 
         if force_retranslate:
@@ -636,6 +940,8 @@ class WarmScanlationEngine:
             timings_ms=timings,
             quota=quota_snap,
             blocks=blocks,
+            reading_direction=effective_dir,
+            slices_count=slices_count,
         )
 
     def translate_batch_bytes(
@@ -644,6 +950,7 @@ class WarmScanlationEngine:
         *,
         model: Optional[str] = None,
         source_lang: Optional[str] = None,
+        reading_direction: str = "auto",
         style: str = "scanlation",
         uppercase: bool = True,
         output_format: str = "webp",
@@ -658,6 +965,7 @@ class WarmScanlationEngine:
         self.touch_activity()
         chosen_model = validate_free_tier_model(model or self.config.gemini_model)
         chosen_lang = normalize_source_lang(source_lang or self.default_source_lang)
+        chosen_dir = normalize_reading_direction(reading_direction)
         chosen_style = (style or "scanlation").strip().lower()
         if chosen_style not in {"scanlation", "informal", "fiel", "formal"}:
             chosen_style = "scanlation"
@@ -673,14 +981,23 @@ class WarmScanlationEngine:
             img_h, img_w = image_bgr.shape[:2]
             image_sha = hashlib.sha256(raw_bytes).hexdigest()
 
-            no_text, cache_hit, blocks, inpainted_bgr, det_lang, devices, local_t = (
-                self._run_local_vision_stages(
-                    image_bgr,
-                    image_sha,
-                    chosen_lang,
-                    use_cache=use_cache,
-                    force_retranslate=force_retranslate,
-                )
+            (
+                no_text,
+                cache_hit,
+                blocks,
+                inpainted_bgr,
+                det_lang,
+                eff_dir,
+                slices_count,
+                devices,
+                local_t,
+            ) = self._run_local_vision_stages(
+                image_bgr,
+                image_sha,
+                chosen_lang,
+                reading_direction=chosen_dir,
+                use_cache=use_cache,
+                force_retranslate=force_retranslate,
             )
             if force_retranslate:
                 for b in blocks:
@@ -699,6 +1016,8 @@ class WarmScanlationEngine:
                     "blocks": blocks,
                     "inpainted_bgr": inpainted_bgr,
                     "detected_lang": det_lang,
+                    "reading_direction": eff_dir,
+                    "slices_count": slices_count,
                     "devices": devices,
                     "local_timings": local_t,
                 }
@@ -789,6 +1108,8 @@ class WarmScanlationEngine:
                     quota=quota_snap,
                     blocks=p["blocks"],
                     used_fallback=(idx in fallback_indices_global),
+                    reading_direction=p["reading_direction"],
+                    slices_count=p["slices_count"],
                 )
             )
             self._pages_processed += 1

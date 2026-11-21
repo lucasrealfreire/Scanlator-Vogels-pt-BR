@@ -11,11 +11,17 @@
  */
 
 import {
+  createEmptyGlossaryStore,
+  hashGlossary,
+  resolveActiveSeriesForUrl,
+} from "../shared/glossary";
+import {
   DEFAULT_SETTINGS,
   type BackendHealth,
   type EngineActionResponse,
   type EngineLifecycleState,
   type ExtensionSettings,
+  type GlossaryStore,
   type RuntimeMessage,
   type SourceLanguage,
   type TranslateBatchResponse,
@@ -24,6 +30,7 @@ import {
 } from "../shared/types";
 import type { DetectedMangaPage } from "./adapters/types";
 import { CacheManager, buildCacheKey } from "./cacheManager";
+import { ManualCropOverlay } from "./cropOverlay";
 import { FloatingPanel } from "./floatingPanel";
 import { ImageDetector } from "./imageDetector";
 import { OverlayManager } from "./overlayManager";
@@ -33,11 +40,20 @@ if (!(window as unknown as { __svPtBrLoaded?: boolean }).__svPtBrLoaded) {
   (window as unknown as { __svPtBrLoaded?: boolean }).__svPtBrLoaded = true;
 
   let settings: ExtensionSettings = { ...DEFAULT_SETTINGS };
+  let glossaryStore: GlossaryStore = createEmptyGlossaryStore();
   let engineState: EngineLifecycleState = "stopped";
   let lastHealth: BackendHealth | null = null;
   const preparedUrls = new Set<string>();
 
   const cache = new CacheManager();
+
+  function getActiveGlossary(): Record<string, string> {
+    return resolveActiveSeriesForUrl(glossaryStore, window.location.href).series.terms;
+  }
+
+  function getActiveGlossaryHash(): string {
+    return hashGlossary(getActiveGlossary());
+  }
 
   function base64ToBlob(b64: string, mime = "image/webp"): Blob {
     const bin = atob(b64);
@@ -190,6 +206,10 @@ if (!(window as unknown as { __svPtBrLoaded?: boolean }).__svPtBrLoaded) {
         void translateWholeChapter();
       }
     },
+    onManualCrop: () => {
+      panel.setExpanded(false);
+      void cropOverlay.start();
+    },
     onToggleAutoTranslate: async (enabled) => {
       await setAutoTranslate(enabled);
     },
@@ -210,6 +230,15 @@ if (!(window as unknown as { __svPtBrLoaded?: boolean }).__svPtBrLoaded) {
       queue.resume();
       void translateVisibleNow();
     },
+  });
+
+  const cropOverlay = new ManualCropOverlay({
+    ensureEngineRunning,
+    getActiveGlossary,
+    onError: (resp) => {
+      if (!resp.ok) handleTranslationError(resp);
+    },
+    onToast: (msg) => panel.showToast(msg),
   });
 
   const detector = new ImageDetector({
@@ -269,9 +298,10 @@ if (!(window as unknown as { __svPtBrLoaded?: boolean }).__svPtBrLoaded) {
   }
 
   async function hydrateFromCache(pages: DetectedMangaPage[]): Promise<void> {
+    const gHash = getActiveGlossaryHash();
     for (const p of pages) {
       if (overlay.getState(p.element) !== "idle") continue;
-      const key = buildCacheKey(p.imageUrl, settings);
+      const key = buildCacheKey(p.imageUrl, settings, gHash);
       const cached = await cache.get(key);
       if (!cached) continue;
       if (cached.noText) {
@@ -441,7 +471,9 @@ if (!(window as unknown as { __svPtBrLoaded?: boolean }).__svPtBrLoaded) {
     const { page, forceRetranslate } = task;
     if (!page.element.isConnected) return;
 
-    const cacheKey = buildCacheKey(page.imageUrl, settings);
+    const glossary = getActiveGlossary();
+    const gHash = hashGlossary(glossary);
+    const cacheKey = buildCacheKey(page.imageUrl, settings, gHash);
     if (!forceRetranslate) {
       const cached = await cache.get(cacheKey);
       if (cached) {
@@ -474,6 +506,7 @@ if (!(window as unknown as { __svPtBrLoaded?: boolean }).__svPtBrLoaded) {
       pageUrl: window.location.href,
       imageBase64: canvasB64,
       forceRetranslate,
+      glossary: Object.keys(glossary).length > 0 ? glossary : undefined,
     } satisfies RuntimeMessage)) as TranslatePageResponse;
 
     if (!resp.ok) {
@@ -515,12 +548,14 @@ if (!(window as unknown as { __svPtBrLoaded?: boolean }).__svPtBrLoaded) {
   }
 
   async function processBatchTasks(tasks: QueueTask[], nextTasks: QueueTask[]): Promise<void> {
+    const glossary = getActiveGlossary();
+    const gHash = hashGlossary(glossary);
     const uncached: Array<{ task: QueueTask; pageId: string; cacheKey: string }> = [];
 
     for (let i = 0; i < tasks.length; i++) {
       const task = tasks[i];
       if (!task.page.element.isConnected) continue;
-      const cacheKey = buildCacheKey(task.page.imageUrl, settings);
+      const cacheKey = buildCacheKey(task.page.imageUrl, settings, gHash);
       if (!task.forceRetranslate) {
         const cached = await cache.get(cacheKey);
         if (cached) {
@@ -563,6 +598,7 @@ if (!(window as unknown as { __svPtBrLoaded?: boolean }).__svPtBrLoaded) {
     const resp = (await chrome.runtime.sendMessage({
       type: "TRANSLATE_BATCH_URLS",
       pageUrl: window.location.href,
+      glossary: Object.keys(glossary).length > 0 ? glossary : undefined,
       items,
     } satisfies RuntimeMessage)) as TranslateBatchResponse;
 
@@ -620,7 +656,10 @@ if (!(window as unknown as { __svPtBrLoaded?: boolean }).__svPtBrLoaded) {
     await refreshEngineTelemetry();
   }
 
-  // Global keyboard shortcuts: Alt+T (translate current page), Alt+Shift+T (toggle Auto Translate)
+  // Global keyboard shortcuts:
+  // - Alt+T: translate current page
+  // - Alt+Shift+T: toggle Auto Translate
+  // - Alt+S: Manual Crop / Screenshot mode (for <canvas> / DRM readers)
   window.addEventListener("keydown", (e: KeyboardEvent) => {
     const target = e.target as HTMLElement | null;
     if (
@@ -632,12 +671,19 @@ if (!(window as unknown as { __svPtBrLoaded?: boolean }).__svPtBrLoaded) {
     ) {
       return;
     }
-    if (e.altKey && !e.ctrlKey && !e.metaKey && e.key.toLowerCase() === "t") {
-      e.preventDefault();
-      if (e.shiftKey) {
-        void setAutoTranslate(!settings.autoTranslate);
-      } else {
-        void translateVisibleNow();
+    if (e.altKey && !e.ctrlKey && !e.metaKey) {
+      const key = e.key.toLowerCase();
+      if (key === "t") {
+        e.preventDefault();
+        if (e.shiftKey) {
+          void setAutoTranslate(!settings.autoTranslate);
+        } else {
+          void translateVisibleNow();
+        }
+      } else if (key === "s" && !e.shiftKey) {
+        e.preventDefault();
+        panel.setExpanded(false);
+        void cropOverlay.start();
       }
     }
   });
@@ -655,6 +701,9 @@ if (!(window as unknown as { __svPtBrLoaded?: boolean }).__svPtBrLoaded) {
         scheduleAutoForVisible();
       }
       sendResponse({ ok: true });
+    } else if (message.type === "GLOSSARY_UPDATED") {
+      glossaryStore = message.store;
+      sendResponse({ ok: true });
     } else if (message.type === "ENGINE_STATE_BROADCAST") {
       engineState = message.state;
       lastHealth = message.health;
@@ -669,6 +718,7 @@ if (!(window as unknown as { __svPtBrLoaded?: boolean }).__svPtBrLoaded) {
         await cache.clearAll();
         preparedUrls.clear();
         overlay.restoreAllOriginals();
+        cropOverlay.clearAllPins();
         sendResponse({ ok: true });
       })();
       return true;
@@ -681,6 +731,10 @@ if (!(window as unknown as { __svPtBrLoaded?: boolean }).__svPtBrLoaded) {
     } else if (message.type === "CANCEL_CHAPTER") {
       queue.pauseAndClearPrefetch();
       sendResponse({ ok: true });
+    } else if (message.type === "START_MANUAL_CROP") {
+      panel.setExpanded(false);
+      void cropOverlay.start();
+      sendResponse({ ok: true });
     }
     return false;
   });
@@ -691,6 +745,10 @@ if (!(window as unknown as { __svPtBrLoaded?: boolean }).__svPtBrLoaded) {
         type: "GET_SETTINGS",
       } satisfies RuntimeMessage)) as ExtensionSettings;
       panel.updateSettings(settings);
+
+      glossaryStore = (await chrome.runtime.sendMessage({
+        type: "GET_GLOSSARY_STORE",
+      } satisfies RuntimeMessage)) as GlossaryStore;
 
       const st = (await chrome.runtime.sendMessage({
         type: "ENGINE_STATUS",

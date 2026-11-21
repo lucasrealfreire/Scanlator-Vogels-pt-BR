@@ -301,18 +301,58 @@ def _cluster_orphan_polygons(
     return clusters
 
 
-def sort_blocks_japanese_reading_order(blocks: list[TextBlock]) -> list[TextBlock]:
-    """Order manga text blocks in authentic Japanese reading order.
+def resolve_reading_direction(
+    requested: str,
+    *,
+    detected_lang: str = "ja",
+    blocks: Optional[list[TextBlock]] = None,
+    img_w: int = 0,
+    img_h: int = 0,
+) -> str:
+    """Resolve effective reading direction (`rtl` vs `ltr`) from user setting + page layout/script."""
+    req = (requested or "auto").strip().lower()
+    if req in {"rtl", "ltr"}:
+        return req
 
-    Uses Recursive XY-Cut:
-    1. Split along clean horizontal gaps (panel rows: top -> bottom).
-    2. Split along clean vertical gaps (panel columns & bubbles: right -> left).
-    3. Recurse until indivisible, then sort any overlapping leaf bubbles upper-right first.
+    # Tall vertical webtoon / manhwa strips ALWAYS read top-to-bottom, left-to-right
+    if img_w > 0 and img_h > int(round(img_w * 2.2)):
+        return "ltr"
+
+    lang = (detected_lang or "ja").strip().lower()
+    if lang in {"ko", "en", "es", "fr", "latin"}:
+        return "ltr"
+    if lang == "ja":
+        return "rtl"
+    if lang in {"zh", "zh_tw"}:
+        if blocks:
+            vert = sum(1 for b in blocks if b.is_vertical)
+            return "rtl" if (vert * 2 >= len(blocks)) else "ltr"
+        return "rtl"
+    return "rtl"
+
+
+def sort_blocks_reading_order(
+    blocks: list[TextBlock],
+    *,
+    direction: str = "rtl",
+    img_w: int = 0,
+    img_h: int = 0,
+) -> list[TextBlock]:
+    """Order text blocks cleanly in RTL (Manga/Vertical CJK) or LTR (Webtoon/Manhwa/Comics).
+
+    Supports:
+    - Double-page spreads (`img_w > img_h * 1.25`): splits cleanly at the center gutter so
+      Page 1 (right half in RTL, left half in LTR) finishes completely before Page 2.
+    - 4-koma dual-column pages: detects full-height vertical strip gutters and reads one
+      vertical column top-to-bottom before moving to the next column.
+    - Standard multi-row comic/manga pages via Recursive XY-Cut.
     """
     if len(blocks) <= 1:
         for i, b in enumerate(blocks, start=1):
             b.id = i
         return blocks
+
+    is_rtl = (direction or "rtl").strip().lower() != "ltr"
 
     def _split_intervals(
         items: list[TextBlock],
@@ -344,7 +384,8 @@ def sort_blocks_japanese_reading_order(blocks: list[TextBlock]) -> list[TextBloc
                 else:
                     groups[-1].append(blk)
                     cur_end = max(cur_end, float(blk.bbox.x2))
-            groups.reverse()  # Rightmost column/panel first
+            if is_rtl:
+                groups.reverse()  # Rightmost column/panel first
             return groups
 
     def _xy_cut(items: list[TextBlock], prefer_axis: str = "y") -> list[TextBlock]:
@@ -362,15 +403,55 @@ def sort_blocks_japanese_reading_order(blocks: list[TextBlock]) -> list[TextBloc
                         ordered.extend(_xy_cut(part, prefer_axis=next_axis))
                     return ordered
 
+        if is_rtl:
+            return sorted(
+                items,
+                key=lambda b: (round(b.bbox.cy * 0.55 - b.bbox.cx * 1.0, 2), b.bbox.y1, -b.bbox.x2),
+            )
         return sorted(
             items,
-            key=lambda b: (round(b.bbox.cy * 0.55 - b.bbox.cx * 1.0, 2), b.bbox.y1, -b.bbox.x2),
+            key=lambda b: (round(b.bbox.cy * 0.55 + b.bbox.cx * 1.0, 2), b.bbox.y1, b.bbox.x1),
         )
 
-    ordered_blocks = _xy_cut(list(blocks), prefer_axis="y")
+    # 1. Double-page spread detection (wide landscape image with clean center seam)
+    if img_w > 0 and img_h > 0 and img_w > int(round(img_h * 1.25)) and len(blocks) >= 2:
+        mid_x = img_w / 2.0
+        crossing = [b for b in blocks if b.bbox.x1 < mid_x - img_w * 0.04 and b.bbox.x2 > mid_x + img_w * 0.04]
+        left_half = [b for b in blocks if b.bbox.cx < mid_x]
+        right_half = [b for b in blocks if b.bbox.cx >= mid_x]
+        if not crossing and left_half and right_half:
+            ordered_halves = (right_half, left_half) if is_rtl else (left_half, right_half)
+            ordered_blocks: list[TextBlock] = []
+            for half in ordered_halves:
+                ordered_blocks.extend(_xy_cut(half, prefer_axis="y"))
+            for idx, blk in enumerate(ordered_blocks, start=1):
+                blk.id = idx
+            return ordered_blocks
+
+    # 2. 4-koma dual-column strip detection:
+    # If there is a clean full-height vertical gutter creating 2 tall columns each having >=3 stacked rows,
+    # read column-by-column top-to-bottom instead of zig-zagging horizontally across the two strips.
+    initial_axis = "y"
+    if len(blocks) >= 6:
+        x_cols = _split_intervals(list(blocks), "x", min_gap_px=12.0)
+        if len(x_cols) == 2 and all(len(c) >= 3 for c in x_cols):
+            # Confirm each column spans >= 55% of the overall vertical text height (4-koma signature)
+            all_y1 = min(b.bbox.y1 for b in blocks)
+            all_y2 = max(b.bbox.y2 for b in blocks)
+            total_span = max(1, all_y2 - all_y1)
+            col_spans = [(max(b.bbox.y2 for b in c) - min(b.bbox.y1 for b in c)) / total_span for c in x_cols]
+            if all(sp >= 0.55 for sp in col_spans):
+                initial_axis = "x"
+
+    ordered_blocks = _xy_cut(list(blocks), prefer_axis=initial_axis)
     for idx, blk in enumerate(ordered_blocks, start=1):
         blk.id = idx
     return ordered_blocks
+
+
+def sort_blocks_japanese_reading_order(blocks: list[TextBlock]) -> list[TextBlock]:
+    """Backward-compatible wrapper for authentic Japanese RTL manga reading order."""
+    return sort_blocks_reading_order(blocks, direction="rtl")
 
 
 class ComicTextDetector:

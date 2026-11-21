@@ -776,20 +776,29 @@ class MangaTextRenderer:
 
             patch = img_rgb[target_box.y1 : target_box.y2, target_box.x1 : target_box.x2]
             if patch.size > 0:
-                lum = float(
-                    np.mean(
-                        0.299 * patch[:, :, 0]
-                        + 0.587 * patch[:, :, 1]
-                        + 0.114 * patch[:, :, 2]
-                    )
+                lum_map = (
+                    0.299 * patch[:, :, 0]
+                    + 0.587 * patch[:, :, 1]
+                    + 0.114 * patch[:, :, 2]
                 )
+                lum = float(np.median(lum_map))
+                bg_std = float(np.std(lum_map))
             else:
                 lum = 255.0
+                bg_std = 0.0
 
-            is_dark_bg = lum < 115.0
-            use_stroke = not block.is_solid_bubble
-            fill_color = (248, 248, 248) if is_dark_bg else (18, 18, 18)
-            stroke_color = (15, 15, 15) if is_dark_bg else (255, 255, 255)
+            # True adaptive contrast for colored webtoons, black bubbles, and dark RPG system boxes:
+            # - Dark background (`lum < 128`): crisp white lettering + thin black stroke
+            # - Light/colored background (`lum >= 128`): crisp black lettering + subtle white halo if textured/colored
+            is_dark_bg = lum < 128.0
+            if is_dark_bg:
+                fill_color = (250, 250, 250)
+                stroke_color = (12, 12, 12)
+                use_stroke = True
+            else:
+                fill_color = (18, 18, 18)
+                stroke_color = (252, 252, 252)
+                use_stroke = (not block.is_solid_bubble) or (bg_std >= 14.0)
 
             layout: Optional[FittedLayout] = None
             if block.is_solid_bubble:
@@ -879,6 +888,9 @@ class MangaTextRenderer:
         )
 
 
+WEBP_MAX_DIMENSION = 16383
+
+
 def encode_pil_image_fast(
     pil_img: Image.Image,
     *,
@@ -886,10 +898,24 @@ def encode_pil_image_fast(
     webp_quality: int = 89,
     webp_method: int = 1,
 ) -> tuple[bytes, str]:
-    """Encode PIL RGB image directly to ultra-fast WebP (`method=1`, `q=89`) or PNG."""
+    """Encode PIL RGB image directly to ultra-fast WebP (`method=1`, `q=89`), JPEG, or PNG.
+
+    Automatically falls back to fast JPEG (`quality=90`, `image/jpeg`) when image width or
+    height exceeds WebP's physical 16,383 px limit (e.g. giant Webtoon strips).
+    """
     fmt = (output_format or "webp").strip().lower()
     buf = io.BytesIO()
     if fmt == "webp":
+        if pil_img.width > WEBP_MAX_DIMENSION or pil_img.height > WEBP_MAX_DIMENSION:
+            logger.info(
+                "Dimensao %dx%d excede limite fisico WebP (%dpx); usando fallback JPEG rapido (q=90).",
+                pil_img.width,
+                pil_img.height,
+                WEBP_MAX_DIMENSION,
+            )
+            rgb_img = pil_img.convert("RGB") if pil_img.mode != "RGB" else pil_img
+            rgb_img.save(buf, format="JPEG", quality=90, optimize=False)
+            return buf.getvalue(), "image/jpeg"
         pil_img.save(
             buf,
             format="WEBP",
@@ -897,6 +923,10 @@ def encode_pil_image_fast(
             method=int(np.clip(webp_method, 0, 6)),
         )
         return buf.getvalue(), "image/webp"
+    if fmt in {"jpg", "jpeg"}:
+        rgb_img = pil_img.convert("RGB") if pil_img.mode != "RGB" else pil_img
+        rgb_img.save(buf, format="JPEG", quality=90, optimize=False)
+        return buf.getvalue(), "image/jpeg"
     pil_img.save(buf, format="PNG", compress_level=3)
     return buf.getvalue(), "image/png"
 

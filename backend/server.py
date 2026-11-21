@@ -52,6 +52,7 @@ class IdleTimeoutRequest(BaseModel):
 class PreparePageRequest(BaseModel):
     image_base64: str
     source_lang: str = "auto"
+    reading_direction: str = "auto"
     use_cache: bool = True
 
 
@@ -59,6 +60,8 @@ class Base64TranslateRequest(BaseModel):
     image_base64: str
     model: Optional[str] = None
     source_lang: str = "auto"
+    reading_direction: str = "auto"
+    direct_ocr: bool = False
     style: str = "scanlation"
     uppercase: bool = True
     output_format: str = "webp"
@@ -79,6 +82,7 @@ class BatchTranslateRequest(BaseModel):
     pages: list[BatchPageInput] = Field(..., min_length=1, max_length=MAX_BATCH_PAGES)
     model: Optional[str] = None
     source_lang: str = "auto"
+    reading_direction: str = "auto"
     style: str = "scanlation"
     uppercase: bool = True
     output_format: str = "webp"
@@ -267,6 +271,7 @@ def create_app(
                 eng.prepare_image_bytes,
                 raw_bytes,
                 source_lang=body.source_lang,
+                reading_direction=body.reading_direction,
                 use_cache=body.use_cache,
             )
             return {
@@ -298,6 +303,8 @@ def create_app(
         raw_bytes: bytes
         model: Optional[str] = None
         source_lang: str = "auto"
+        reading_direction: str = "auto"
+        direct_ocr: bool = False
         style: str = "scanlation"
         uppercase: bool = True
         output_format: str = "webp"
@@ -330,6 +337,8 @@ def create_app(
                     )
                 model = str(form.get("model")).strip() if form.get("model") else None
                 source_lang = str(form.get("source_lang") or "auto")
+                reading_direction = str(form.get("reading_direction") or "auto")
+                direct_ocr = _parse_bool(form.get("direct_ocr"), False)
                 style = str(form.get("style") or "scanlation")
                 uppercase = _parse_bool(form.get("uppercase"), True)
                 output_format = str(form.get("output_format") or "webp")
@@ -346,6 +355,8 @@ def create_app(
                 raw_bytes = _decode_base64_image(parsed.image_base64)
                 model = parsed.model
                 source_lang = parsed.source_lang
+                reading_direction = parsed.reading_direction
+                direct_ocr = parsed.direct_ocr
                 style = parsed.style
                 uppercase = parsed.uppercase
                 output_format = parsed.output_format
@@ -369,6 +380,8 @@ def create_app(
                 raw_bytes,
                 model=model,
                 source_lang=source_lang,
+                reading_direction=reading_direction,
+                direct_ocr=direct_ocr,
                 style=style,
                 uppercase=uppercase,
                 output_format=output_format,
@@ -399,6 +412,8 @@ def create_app(
             "model": result.model,
             "source_lang": result.source_lang,
             "detected_lang": result.detected_lang,
+            "reading_direction": result.reading_direction,
+            "slices_count": result.slices_count,
             "style": result.style,
             "uppercase": result.uppercase,
             "devices": {
@@ -448,6 +463,7 @@ def create_app(
                 decoded_items,
                 model=body.model,
                 source_lang=body.source_lang,
+                reading_direction=body.reading_direction,
                 style=body.style,
                 uppercase=body.uppercase,
                 output_format=body.output_format,
@@ -492,6 +508,8 @@ def create_app(
                     "translated_blocks_count": p.translated_blocks_count,
                     "cache_hit_local": p.cache_hit_local,
                     "detected_lang": p.detected_lang,
+                    "reading_direction": p.reading_direction,
+                    "slices_count": p.slices_count,
                     "used_fallback": p.used_fallback,
                     "timings_ms": p.timings_ms,
                     "blocks": [

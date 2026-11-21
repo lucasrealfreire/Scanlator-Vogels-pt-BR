@@ -4,6 +4,7 @@ import {
   FREE_TIER_MODELS,
   type ExtensionSettings,
   type FreeTierModel,
+  type ReadingDirection,
   type SourceLanguage,
   type TranslationStyle,
 } from "./types";
@@ -18,8 +19,23 @@ function sanitizeModel(model: unknown): FreeTierModel {
 }
 
 function sanitizeSourceLang(lang: unknown): SourceLanguage {
-  if (lang === "auto" || lang === "ja" || lang === "en" || lang === "ko" || lang === "zh") {
+  if (
+    lang === "auto" ||
+    lang === "ja" ||
+    lang === "ko" ||
+    lang === "zh" ||
+    lang === "en" ||
+    lang === "es" ||
+    lang === "fr"
+  ) {
     return lang;
+  }
+  return "auto";
+}
+
+function sanitizeReadingDirection(dir: unknown): ReadingDirection {
+  if (dir === "auto" || dir === "rtl" || dir === "ltr") {
+    return dir;
   }
   return "auto";
 }
@@ -38,6 +54,7 @@ export async function loadSettings(): Promise<ExtensionSettings> {
     apiKey: typeof raw.apiKey === "string" ? raw.apiKey.trim() : DEFAULT_SETTINGS.apiKey,
     model: sanitizeModel(raw.model),
     sourceLang: sanitizeSourceLang(raw.sourceLang),
+    readingDirection: sanitizeReadingDirection(raw.readingDirection),
     style: sanitizeStyle(raw.style),
     uppercase: typeof raw.uppercase === "boolean" ? raw.uppercase : DEFAULT_SETTINGS.uppercase,
     autoTranslate:
@@ -64,6 +81,7 @@ export async function saveSettings(patch: Partial<ExtensionSettings>): Promise<E
     ...patch,
     model: sanitizeModel(patch.model ?? current.model),
     sourceLang: sanitizeSourceLang(patch.sourceLang ?? current.sourceLang),
+    readingDirection: sanitizeReadingDirection(patch.readingDirection ?? current.readingDirection),
     style: sanitizeStyle(patch.style ?? current.style),
     apiKey: typeof patch.apiKey === "string" ? patch.apiKey.trim() : current.apiKey,
   };

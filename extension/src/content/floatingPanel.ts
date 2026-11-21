@@ -24,6 +24,7 @@ export interface FloatingPanelCallbacks {
   onToggleEngine: () => void;
   onTranslateVisible: () => void;
   onToggleChapter: () => void;
+  onManualCrop: () => void;
   onToggleAutoTranslate: (enabled: boolean) => void;
   onChangeSourceLang: (lang: SourceLanguage) => void;
   onResumeCircuit: () => void;
@@ -45,6 +46,7 @@ export class FloatingPanel {
   private langSelect: HTMLSelectElement;
   private translateNowBtn: HTMLButtonElement;
   private chapterBtn: HTMLButtonElement;
+  private cropBtn: HTMLButtonElement;
   private autoCheckbox: HTMLInputElement;
   private progressEl: HTMLDivElement;
   private alertEl: HTMLDivElement;
@@ -152,6 +154,7 @@ export class FloatingPanel {
       }
       .sv-btn-primary { background: #0284c7; color: #fff; }
       .sv-btn-chapter { background: #6366f1; color: #fff; }
+      .sv-btn-crop { width: 100%; margin-bottom: 8px; background: #0f766e; color: #fff; }
       .sv-btn-cancel { background: #b91c1c; color: #fff; }
       .sv-telemetry {
         font-size: 11px; color: #94a3b8; background: rgba(30, 41, 59, 0.72);
@@ -202,7 +205,7 @@ export class FloatingPanel {
     this.pillBtn = document.createElement("button");
     this.pillBtn.type = "button";
     this.pillBtn.className = "sv-fab";
-    this.pillBtn.title = "Scanlator Vogels PT-BR (Alt+T página | Alt+Shift+T auto)";
+    this.pillBtn.title = "Scanlator Vogels PT-BR (Alt+T página | Alt+S recorte | Alt+Shift+T auto)";
     this.pillDot = document.createElement("span");
     this.pillDot.className = "sv-dot stopped";
     this.pillText = document.createElement("span");
@@ -229,12 +232,13 @@ export class FloatingPanel {
         <button type="button" class="sv-btn sv-btn-primary" id="svPageBtn">Traduzir Página</button>
         <button type="button" class="sv-btn sv-btn-chapter" id="svChapterBtn">Traduzir Capítulo</button>
       </div>
+      <button type="button" class="sv-btn sv-btn-crop" id="svCropBtn">Recorte Manual (Alt+S)</button>
       <label class="sv-toggle">
-        <span>Auto Translate (prefetch)</span>
+        <span>Auto Translate (lote de 4)</span>
         <input type="checkbox" />
       </label>
       <div class="sv-meta-row">
-        <span>Alt+T • Alt+Shift+T</span>
+        <span>Alt+T • Alt+S • Alt+Shift+T</span>
         <span class="sv-progress">0 / 0 págs</span>
       </div>
       <div class="sv-alert">
@@ -251,6 +255,7 @@ export class FloatingPanel {
     this.langSelect = this.cardEl.querySelector("#svLang") as HTMLSelectElement;
     this.translateNowBtn = this.cardEl.querySelector("#svPageBtn") as HTMLButtonElement;
     this.chapterBtn = this.cardEl.querySelector("#svChapterBtn") as HTMLButtonElement;
+    this.cropBtn = this.cardEl.querySelector("#svCropBtn") as HTMLButtonElement;
     this.autoCheckbox = this.cardEl.querySelector("input[type='checkbox']") as HTMLInputElement;
     this.progressEl = this.cardEl.querySelector(".sv-progress") as HTMLDivElement;
     this.alertEl = this.cardEl.querySelector(".sv-alert") as HTMLDivElement;
@@ -270,6 +275,7 @@ export class FloatingPanel {
     this.engineBtn.addEventListener("click", () => this.callbacks.onToggleEngine());
     this.translateNowBtn.addEventListener("click", () => this.callbacks.onTranslateVisible());
     this.chapterBtn.addEventListener("click", () => this.callbacks.onToggleChapter());
+    this.cropBtn.addEventListener("click", () => this.callbacks.onManualCrop());
     this.autoCheckbox.addEventListener("change", () =>
       this.callbacks.onToggleAutoTranslate(this.autoCheckbox.checked)
     );
@@ -308,6 +314,7 @@ export class FloatingPanel {
       this.engineBtn.disabled = false;
       this.translateNowBtn.disabled = false;
       this.chapterBtn.disabled = false;
+      this.cropBtn.disabled = false;
 
       const vramTxt = health.warming_up
         ? "Aquecendo GPU..."
@@ -326,6 +333,7 @@ export class FloatingPanel {
       this.engineBtn.disabled = true;
       this.translateNowBtn.disabled = true;
       this.chapterBtn.disabled = true;
+      this.cropBtn.disabled = true;
       this.telemetryEl.textContent = "Iniciando servidor local em 127.0.0.1...";
     } else if (state === "stopping") {
       this.statusTextEl.textContent = "Motor: Desligando...";
@@ -333,6 +341,7 @@ export class FloatingPanel {
       this.engineBtn.disabled = true;
       this.translateNowBtn.disabled = true;
       this.chapterBtn.disabled = true;
+      this.cropBtn.disabled = true;
       this.telemetryEl.textContent = "Liberando 100% da VRAM...";
     } else {
       this.statusTextEl.textContent = "Motor: Desligado";
@@ -341,6 +350,7 @@ export class FloatingPanel {
       this.engineBtn.disabled = false;
       this.translateNowBtn.disabled = false;
       this.chapterBtn.disabled = false;
+      this.cropBtn.disabled = false;
       this.telemetryEl.textContent = "0% CPU • 0 MB RAM • 0 MB VRAM";
     }
   }

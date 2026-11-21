@@ -1,5 +1,5 @@
 /**
- * Shared types & strict Free Tier constants for Scanlator Vogels PT-BR (Manifest V3).
+ * Shared types & strict Free Tier constants for Scanlator Vogels PT-BR v1.1 (Manifest V3).
  */
 
 export const NATIVE_HOST_NAME = "com.scanlatorvogels.host" as const;
@@ -22,19 +22,30 @@ export const PROMPT_VERSION = "v3-scanlation-turbo" as const;
 export type TranslationStyle = "scanlation" | "informal" | "fiel" | "formal";
 
 export const SOURCE_LANGUAGES = [
-  { value: "auto", label: "Auto (JP/EN)" },
+  { value: "auto", label: "Auto (Universal)" },
   { value: "ja", label: "Japonês" },
-  { value: "en", label: "Inglês" },
   { value: "ko", label: "Coreano" },
   { value: "zh", label: "Chinês" },
+  { value: "en", label: "Inglês" },
+  { value: "es", label: "Espanhol" },
+  { value: "fr", label: "Francês" },
 ] as const;
 
 export type SourceLanguage = (typeof SOURCE_LANGUAGES)[number]["value"];
+
+export const READING_DIRECTIONS = [
+  { value: "auto", label: "Auto" },
+  { value: "rtl", label: "Mangá (Dir → Esq)" },
+  { value: "ltr", label: "Webtoon/Comic (Esq → Dir)" },
+] as const;
+
+export type ReadingDirection = (typeof READING_DIRECTIONS)[number]["value"];
 
 export interface ExtensionSettings {
   apiKey: string;
   model: FreeTierModel;
   sourceLang: SourceLanguage;
+  readingDirection: ReadingDirection;
   style: TranslationStyle;
   uppercase: boolean;
   autoTranslate: boolean; // OFF by default — explicit activation required
@@ -47,6 +58,7 @@ export const DEFAULT_SETTINGS: ExtensionSettings = {
   apiKey: "",
   model: DEFAULT_FREE_MODEL,
   sourceLang: "auto",
+  readingDirection: "auto",
   style: "scanlation",
   uppercase: true,
   autoTranslate: false,
@@ -54,6 +66,19 @@ export const DEFAULT_SETTINGS: ExtensionSettings = {
   backendPort: 8765,
   prefetchCount: 4,
 };
+
+export interface SeriesGlossary {
+  slug: string;
+  name: string;
+  terms: Record<string, string>;
+  updatedAt: number;
+}
+
+export interface GlossaryStore {
+  series: Record<string, SeriesGlossary>;
+  /** Optional explicit mapping from detected URL slug -> active custom series slug */
+  urlOverrides: Record<string, string>;
+}
 
 export type EngineLifecycleState = "stopped" | "starting" | "running" | "stopping";
 
@@ -102,6 +127,13 @@ export interface BackendHealth {
   quota: QuotaStatus;
 }
 
+export interface TranslatedBlockInfo {
+  id: number;
+  source_text: string;
+  translated_text: string;
+  inpaint_method?: string;
+}
+
 export interface TranslatePageResult {
   ok: true;
   prompt_version?: string;
@@ -115,6 +147,10 @@ export interface TranslatePageResult {
   translated_blocks_count: number;
   cache_hit_local: boolean;
   model: string;
+  source_lang?: string;
+  detected_lang?: string;
+  reading_direction?: string;
+  slices_count?: number;
   style: string;
   uppercase: boolean;
   timings_ms: Record<string, number>;
@@ -125,6 +161,7 @@ export interface TranslatePageResult {
   };
   circuit_breaker: CircuitBreakerStatus;
   quota: QuotaStatus | null;
+  blocks?: TranslatedBlockInfo[];
 }
 
 export interface TranslateBatchPageResult {
@@ -139,6 +176,8 @@ export interface TranslateBatchPageResult {
   translated_blocks_count: number;
   cache_hit_local: boolean;
   detected_lang?: string;
+  reading_direction?: string;
+  slices_count?: number;
   used_fallback?: boolean;
   timings_ms: Record<string, number>;
 }
@@ -194,24 +233,37 @@ export interface EngineActionResponse {
   message?: string;
 }
 
+export interface CaptureTabResponse {
+  ok: boolean;
+  dataUrl?: string;
+  message?: string;
+}
+
 export type RuntimeMessage =
   | { type: "GET_SETTINGS" }
   | { type: "SAVE_SETTINGS"; settings: Partial<ExtensionSettings> }
+  | { type: "GET_GLOSSARY_STORE" }
+  | { type: "SAVE_GLOSSARY_STORE"; store: GlossaryStore }
+  | { type: "GLOSSARY_UPDATED"; store: GlossaryStore }
   | { type: "ENGINE_STATUS" }
   | { type: "ENGINE_START" }
   | { type: "ENGINE_STOP" }
   | { type: "RESET_CIRCUIT_BREAKER" }
   | { type: "UPDATE_IDLE_TIMEOUT"; idleTimeoutSec: number }
+  | { type: "CAPTURE_VISIBLE_TAB" }
   | {
       type: "TRANSLATE_IMAGE_URL";
       imageUrl: string;
       pageUrl: string;
       imageBase64?: string;
       forceRetranslate?: boolean;
+      directOcr?: boolean;
+      glossary?: Record<string, string>;
     }
   | {
       type: "TRANSLATE_BATCH_URLS";
       pageUrl: string;
+      glossary?: Record<string, string>;
       items: Array<{
         pageId: string;
         imageUrl: string;
@@ -229,5 +281,6 @@ export type RuntimeMessage =
   | { type: "TRANSLATE_VISIBLE_PAGE" }
   | { type: "TRANSLATE_CHAPTER" }
   | { type: "CANCEL_CHAPTER" }
+  | { type: "START_MANUAL_CROP" }
   | { type: "SETTINGS_UPDATED"; settings: ExtensionSettings }
   | { type: "ENGINE_STATE_BROADCAST"; state: EngineLifecycleState; health: BackendHealth | null };

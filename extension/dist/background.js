@@ -1,97 +1,145 @@
-const N = "com.scanlatorvogels.host", O = [
+const y = "scanlator_vogels_glossaries_v1";
+function _(e) {
+  return decodeURIComponent(e || "").toLowerCase().replace(/[^a-z0-9\u00c0-\u024f\u3040-\u9fff\uac00-\ud7af]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 72) || "obra-padrao";
+}
+function k(e) {
+  return e.split(/[-_]+/).filter(Boolean).map((t) => t.charAt(0).toUpperCase() + t.slice(1)).join(" ");
+}
+function D() {
+  return { series: {}, urlOverrides: {} };
+}
+function O(e) {
+  if (!e || typeof e != "object") return D();
+  const t = e, a = {};
+  if (t.series && typeof t.series == "object")
+    for (const [o, n] of Object.entries(t.series)) {
+      if (!n || typeof n != "object") continue;
+      const i = _(n.slug || o), l = {};
+      if (n.terms && typeof n.terms == "object")
+        for (const [s, c] of Object.entries(n.terms)) {
+          const d = String(s).trim(), S = String(c).trim();
+          d && S && (l[d] = S);
+        }
+      a[i] = {
+        slug: i,
+        name: String(n.name || k(i)).trim() || k(i),
+        terms: l,
+        updatedAt: typeof n.updatedAt == "number" ? n.updatedAt : Date.now()
+      };
+    }
+  const r = {};
+  if (t.urlOverrides && typeof t.urlOverrides == "object")
+    for (const [o, n] of Object.entries(t.urlOverrides))
+      typeof n == "string" && n.trim() && (r[_(o)] = _(n));
+  return { series: a, urlOverrides: r };
+}
+async function U() {
+  const e = await chrome.storage.local.get(y);
+  return O(e[y]);
+}
+async function B(e) {
+  const t = O(e);
+  return await chrome.storage.local.set({ [y]: t }), t;
+}
+const G = "com.scanlatorvogels.host", j = [
   "gemini-3.5-flash-lite",
   "gemini-3.1-flash-lite",
   "gemini-3.6-flash",
   "gemini-3.8-flash"
-], L = "gemini-3.5-flash-lite", p = {
+], K = "gemini-3.5-flash-lite", h = {
   apiKey: "",
   uppercase: !0,
   autoTranslate: !1,
   idleTimeoutSec: 300,
   backendPort: 8765,
   prefetchCount: 4
-}, T = "scanlator_vogels_settings_v1";
-function y(e) {
-  return typeof e == "string" && O.includes(e) ? e : L;
+}, E = "scanlator_vogels_settings_v1";
+function I(e) {
+  return typeof e == "string" && j.includes(e) ? e : K;
 }
-function w(e) {
-  return e === "auto" || e === "ja" || e === "en" || e === "ko" || e === "zh" ? e : "auto";
+function v(e) {
+  return e === "auto" || e === "ja" || e === "ko" || e === "zh" || e === "en" || e === "es" || e === "fr" ? e : "auto";
 }
-function k(e) {
+function P(e) {
+  return e === "auto" || e === "rtl" || e === "ltr" ? e : "auto";
+}
+function N(e) {
   return e === "scanlation" || e === "informal" || e === "fiel" || e === "formal" ? e : "scanlation";
 }
-async function l() {
-  const t = (await chrome.storage.local.get(T))[T] ?? {};
+async function f() {
+  const t = (await chrome.storage.local.get(E))[E] ?? {};
   return {
-    apiKey: typeof t.apiKey == "string" ? t.apiKey.trim() : p.apiKey,
-    model: y(t.model),
-    sourceLang: w(t.sourceLang),
-    style: k(t.style),
-    uppercase: typeof t.uppercase == "boolean" ? t.uppercase : p.uppercase,
-    autoTranslate: typeof t.autoTranslate == "boolean" ? t.autoTranslate : p.autoTranslate,
-    idleTimeoutSec: typeof t.idleTimeoutSec == "number" && t.idleTimeoutSec >= 30 && t.idleTimeoutSec <= 3600 ? Math.round(t.idleTimeoutSec) : p.idleTimeoutSec,
-    backendPort: typeof t.backendPort == "number" && t.backendPort >= 1024 && t.backendPort <= 65535 ? Math.round(t.backendPort) : p.backendPort,
-    prefetchCount: typeof t.prefetchCount == "number" && t.prefetchCount >= 3 && t.prefetchCount <= 6 ? Math.round(t.prefetchCount) : p.prefetchCount
+    apiKey: typeof t.apiKey == "string" ? t.apiKey.trim() : h.apiKey,
+    model: I(t.model),
+    sourceLang: v(t.sourceLang),
+    readingDirection: P(t.readingDirection),
+    style: N(t.style),
+    uppercase: typeof t.uppercase == "boolean" ? t.uppercase : h.uppercase,
+    autoTranslate: typeof t.autoTranslate == "boolean" ? t.autoTranslate : h.autoTranslate,
+    idleTimeoutSec: typeof t.idleTimeoutSec == "number" && t.idleTimeoutSec >= 30 && t.idleTimeoutSec <= 3600 ? Math.round(t.idleTimeoutSec) : h.idleTimeoutSec,
+    backendPort: typeof t.backendPort == "number" && t.backendPort >= 1024 && t.backendPort <= 65535 ? Math.round(t.backendPort) : h.backendPort,
+    prefetchCount: typeof t.prefetchCount == "number" && t.prefetchCount >= 3 && t.prefetchCount <= 6 ? Math.round(t.prefetchCount) : h.prefetchCount
   };
 }
-async function S(e) {
-  const t = await l(), a = {
+async function L(e) {
+  const t = await f(), a = {
     ...t,
     ...e,
-    model: y(e.model ?? t.model),
-    sourceLang: w(e.sourceLang ?? t.sourceLang),
-    style: k(e.style ?? t.style),
+    model: I(e.model ?? t.model),
+    sourceLang: v(e.sourceLang ?? t.sourceLang),
+    readingDirection: P(e.readingDirection ?? t.readingDirection),
+    style: N(e.style ?? t.style),
     apiKey: typeof e.apiKey == "string" ? e.apiKey.trim() : t.apiKey
   };
-  return await chrome.storage.local.set({ [T]: a }), a;
+  return await chrome.storage.local.set({ [E]: a }), a;
 }
-let h = "stopped", g = null, A = 0;
-const _ = 2e4, v = 12e3;
-function f(e) {
+let m = "stopped", b = null, R = 0;
+const T = 2e4, $ = 12e3;
+function p(e) {
   return `http://127.0.0.1:${e}`;
 }
-async function d(e, t = 1500) {
+async function g(e, t = 1500) {
   const a = new AbortController(), r = setTimeout(() => a.abort(), t);
   try {
-    const n = await fetch(`${f(e)}/health`, {
+    const o = await fetch(`${p(e)}/health`, {
       method: "GET",
       signal: a.signal
     });
-    return n.ok ? await n.json() : null;
+    return o.ok ? await o.json() : null;
   } catch {
     return null;
   } finally {
     clearTimeout(r);
   }
 }
-function I(e, t = _) {
+function C(e, t = T) {
   return new Promise((a, r) => {
-    let n = !1;
-    const i = setTimeout(() => {
-      n || (n = !0, r(
+    let o = !1;
+    const n = setTimeout(() => {
+      o || (o = !0, r(
         new Error(
           `Timeout (${Math.round(t / 1e3)}s) aguardando resposta do Native Host. Verifique native_host/host.log e native_host/backend.log.`
         )
       ));
     }, t);
     try {
-      chrome.runtime.sendNativeMessage(N, e, (s) => {
-        if (n) return;
-        n = !0, clearTimeout(i);
-        const o = chrome.runtime.lastError;
-        if (o) {
-          r(new Error(o.message || "Native Messaging Host nao registrado."));
+      chrome.runtime.sendNativeMessage(G, e, (i) => {
+        if (o) return;
+        o = !0, clearTimeout(n);
+        const l = chrome.runtime.lastError;
+        if (l) {
+          r(new Error(l.message || "Native Messaging Host nao registrado."));
           return;
         }
-        a(s ?? {});
+        a(i ?? {});
       });
-    } catch (s) {
-      n || (n = !0, clearTimeout(i), r(s instanceof Error ? s : new Error(String(s))));
+    } catch (i) {
+      o || (o = !0, clearTimeout(n), r(i instanceof Error ? i : new Error(String(i))));
     }
   });
 }
-async function c(e, t) {
-  h = e, g = t, A = Date.now();
+async function u(e, t) {
+  m = e, b = t, R = Date.now();
   try {
     const a = await chrome.tabs.query({});
     for (const r of a)
@@ -104,31 +152,31 @@ async function c(e, t) {
   } catch {
   }
 }
-async function M() {
-  const e = await l(), t = await d(e.backendPort);
-  return t ? (h = "running", g = t, { ok: !0, state: "running", health: t }) : h === "starting" && Date.now() - A < _ + 2e3 ? { ok: !0, state: "starting", health: null } : (h = "stopped", g = null, { ok: !0, state: "stopped", health: null });
+async function H() {
+  const e = await f(), t = await g(e.backendPort);
+  return t ? (m = "running", b = t, { ok: !0, state: "running", health: t }) : m === "starting" && Date.now() - R < T + 2e3 ? { ok: !0, state: "starting", health: null } : (m = "stopped", b = null, { ok: !0, state: "stopped", health: null });
 }
-async function C() {
-  const e = await l(), t = await d(e.backendPort);
+async function z() {
+  const e = await f(), t = await g(e.backendPort);
   if (t)
-    return await c("running", t), { ok: !0, state: "running", health: t, nativeHostAvailable: !0 };
-  await c("starting", null);
+    return await u("running", t), { ok: !0, state: "running", health: t, nativeHostAvailable: !0 };
+  await u("starting", null);
   try {
-    const a = await I(
+    const a = await C(
       {
         action: "start",
         port: e.backendPort,
         idle_timeout_sec: e.idleTimeoutSec
       },
-      _
+      T
     );
     if (a.ok) {
-      const n = a.health ?? await d(e.backendPort, 3e3);
-      if (n)
-        return await c("running", n), { ok: !0, state: "running", health: n, nativeHostAvailable: !0 };
+      const o = a.health ?? await g(e.backendPort, 3e3);
+      if (o)
+        return await u("running", o), { ok: !0, state: "running", health: o, nativeHostAvailable: !0 };
     }
-    const r = await d(e.backendPort, 1500);
-    return r ? (await c("running", r), { ok: !0, state: "running", health: r, nativeHostAvailable: !0 }) : (await c("stopped", null), {
+    const r = await g(e.backendPort, 1500);
+    return r ? (await u("running", r), { ok: !0, state: "running", health: r, nativeHostAvailable: !0 }) : (await u("stopped", null), {
       ok: !1,
       state: "stopped",
       health: null,
@@ -138,8 +186,8 @@ async function C() {
       )
     });
   } catch (a) {
-    const r = await d(e.backendPort, 1500);
-    return r ? (await c("running", r), { ok: !0, state: "running", health: r, nativeHostAvailable: !1 }) : (await c("stopped", null), {
+    const r = await g(e.backendPort, 1500);
+    return r ? (await u("running", r), { ok: !0, state: "running", health: r, nativeHostAvailable: !1 }) : (await u("stopped", null), {
       ok: !1,
       state: "stopped",
       health: null,
@@ -148,38 +196,38 @@ async function C() {
     });
   }
 }
-async function R() {
-  const e = await l();
-  await c("stopping", g);
+async function V() {
+  const e = await f();
+  await u("stopping", b);
   try {
-    await fetch(`${f(e.backendPort)}/shutdown`, {
+    await fetch(`${p(e.backendPort)}/shutdown`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: "{}"
     });
   } catch {
     try {
-      await I({ action: "stop", port: e.backendPort }, v);
+      await C({ action: "stop", port: e.backendPort }, $);
     } catch {
     }
   }
-  for (let t = 0; t < 16 && (await new Promise((r) => setTimeout(r, 250)), !!await d(e.backendPort, 500)); t++)
+  for (let t = 0; t < 16 && (await new Promise((r) => setTimeout(r, 250)), !!await g(e.backendPort, 500)); t++)
     ;
-  return await c("stopped", null), { ok: !0, state: "stopped", health: null };
+  return await u("stopped", null), { ok: !0, state: "stopped", health: null };
 }
-function B(e) {
+function q(e) {
   const t = new Uint8Array(e), a = 32768;
   let r = "";
-  for (let n = 0; n < t.length; n += a) {
-    const i = t.subarray(n, n + a);
-    r += String.fromCharCode(...i);
+  for (let o = 0; o < t.length; o += a) {
+    const n = t.subarray(o, o + a);
+    r += String.fromCharCode(...n);
   }
   return btoa(r);
 }
-async function E(e, t) {
+async function w(e, t) {
   if (e.startsWith("data:")) {
-    const i = e.indexOf(",");
-    if (i >= 0) return e.slice(i + 1);
+    const n = e.indexOf(",");
+    if (n >= 0) return e.slice(n + 1);
   }
   const a = await fetch(e, {
     method: "GET",
@@ -194,12 +242,12 @@ async function E(e, t) {
     throw new Error(
       `Site retornou '${r}' em vez de imagem (possivel bloqueio anti-hotlink ou desafio do site).`
     );
-  const n = await a.arrayBuffer();
-  if (n.byteLength < 512)
+  const o = await a.arrayBuffer();
+  if (o.byteLength < 512)
     throw new Error("Imagem retornada esta vazia ou bloqueada pelo site.");
-  return B(n);
+  return q(o);
 }
-function P(e, t) {
+function M(e, t) {
   const a = String(t.code || "UNKNOWN_ERROR");
   return {
     ok: !1,
@@ -210,141 +258,170 @@ function P(e, t) {
     circuit_breaker: t.circuit_breaker
   };
 }
-async function U(e, t, a, r) {
-  const n = await l(), i = f(n.backendPort);
+async function F(e, t, a, r, o, n) {
+  const i = await f(), l = p(i.backendPort);
   let s = a;
   if (!s)
     try {
-      s = await E(e, t);
-    } catch (o) {
+      s = await w(e, t);
+    } catch (c) {
       return {
         ok: !1,
         code: "CORS_OR_NETWORK_BLOCKED",
-        message: `Este site bloqueou o acesso direto a imagem (${o instanceof Error ? o.message : String(o)}).`
+        message: `Este site bloqueou o acesso direto a imagem (${c instanceof Error ? c.message : String(c)}).`
       };
     }
   try {
-    const o = await fetch(`${i}/translate-page`, {
+    const c = await fetch(`${l}/translate-page`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         image_base64: s,
-        model: n.model,
-        source_lang: n.sourceLang,
-        style: n.style,
-        uppercase: n.uppercase,
+        model: i.model,
+        source_lang: i.sourceLang,
+        reading_direction: i.readingDirection,
+        direct_ocr: o,
+        style: i.style,
+        uppercase: i.uppercase,
         output_format: "webp",
         force_retranslate: r,
-        use_cache: !0,
-        api_key: n.apiKey || void 0,
-        idle_timeout_sec: n.idleTimeoutSec
+        use_cache: !o,
+        api_key: i.apiKey || void 0,
+        glossary: n && Object.keys(n).length > 0 ? n : void 0,
+        idle_timeout_sec: i.idleTimeoutSec
       })
-    }), u = await o.json().catch(() => ({}));
-    return o.ok ? u : P(o.status, u);
+    }), d = await c.json().catch(() => ({}));
+    return c.ok ? d : M(c.status, d);
   } catch {
-    return await c("stopped", null), {
+    return await u("stopped", null), {
       ok: !1,
       code: "ENGINE_OFFLINE",
       message: "Motor local desligado. Clique em 'Ligar Motor' para traduzir."
     };
   }
 }
-async function K(e, t) {
-  const a = await l(), r = f(a.backendPort), n = {}, s = (await Promise.all(
-    t.slice(0, 4).map(async (o) => {
-      if (o.imageBase64)
+async function W(e, t, a) {
+  const r = await f(), o = p(r.backendPort), n = {}, l = (await Promise.all(
+    t.slice(0, 4).map(async (s) => {
+      if (s.imageBase64)
         return {
-          page_id: o.pageId,
-          image_base64: o.imageBase64,
-          force_retranslate: !!o.forceRetranslate
+          page_id: s.pageId,
+          image_base64: s.imageBase64,
+          force_retranslate: !!s.forceRetranslate
         };
       try {
-        const u = await E(o.imageUrl, e);
+        const c = await w(s.imageUrl, e);
         return {
-          page_id: o.pageId,
-          image_base64: u,
-          force_retranslate: !!o.forceRetranslate
+          page_id: s.pageId,
+          image_base64: c,
+          force_retranslate: !!s.forceRetranslate
         };
-      } catch (u) {
-        return n[o.pageId] = `Acesso bloqueado a imagem (${u instanceof Error ? u.message : String(u)}).`, null;
+      } catch (c) {
+        return n[s.pageId] = `Acesso bloqueado a imagem (${c instanceof Error ? c.message : String(c)}).`, null;
       }
     })
-  )).filter((o) => o !== null);
-  if (s.length === 0)
+  )).filter((s) => s !== null);
+  if (l.length === 0)
     return {
       ok: !1,
       code: "CORS_OR_NETWORK_BLOCKED",
       message: Object.values(n)[0] || "Este site bloqueou o acesso as imagens."
     };
   try {
-    const o = await fetch(`${r}/translate-batch`, {
+    const s = await fetch(`${o}/translate-batch`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        pages: s,
-        model: a.model,
-        source_lang: a.sourceLang,
-        style: a.style,
-        uppercase: a.uppercase,
+        pages: l,
+        model: r.model,
+        source_lang: r.sourceLang,
+        reading_direction: r.readingDirection,
+        style: r.style,
+        uppercase: r.uppercase,
         output_format: "webp",
         use_cache: !0,
-        api_key: a.apiKey || void 0,
-        idle_timeout_sec: a.idleTimeoutSec
+        api_key: r.apiKey || void 0,
+        glossary: a && Object.keys(a).length > 0 ? a : void 0,
+        idle_timeout_sec: r.idleTimeoutSec
       })
-    }), u = await o.json().catch(() => ({}));
-    if (!o.ok)
-      return P(o.status, u);
-    const m = u;
-    return m.ok && Object.keys(n).length > 0 && (m.skipped_errors = n), m;
+    }), c = await s.json().catch(() => ({}));
+    if (!s.ok)
+      return M(s.status, c);
+    const d = c;
+    return d.ok && Object.keys(n).length > 0 && (d.skipped_errors = n), d;
   } catch {
-    return await c("stopped", null), {
+    return await u("stopped", null), {
       ok: !1,
       code: "ENGINE_OFFLINE",
       message: "Motor local desligado. Clique em 'Ligar Motor' para traduzir."
     };
   }
 }
-async function D(e, t, a) {
-  const r = await l(), n = f(r.backendPort);
-  let i = a;
-  if (!i)
+async function Y(e) {
+  try {
+    return { ok: !0, dataUrl: await new Promise((a, r) => {
+      chrome.tabs.captureVisibleTab(e ?? chrome.windows.WINDOW_ID_CURRENT, { format: "png" }, (o) => {
+        const n = chrome.runtime.lastError;
+        if (n) {
+          r(new Error(n.message || "Falha ao capturar aba visivel."));
+          return;
+        }
+        if (!o) {
+          r(new Error("Captura de tela retornou vazia."));
+          return;
+        }
+        a(o);
+      });
+    }) };
+  } catch (t) {
+    return {
+      ok: !1,
+      message: t instanceof Error ? t.message : String(t)
+    };
+  }
+}
+async function x(e, t, a) {
+  const r = await f(), o = p(r.backendPort);
+  let n = a;
+  if (!n)
     try {
-      i = await E(e, t);
+      n = await w(e, t);
     } catch {
       return { ok: !1, skipped: !0 };
     }
   try {
-    const s = await fetch(`${n}/prepare-page`, {
+    const i = await fetch(`${o}/prepare-page`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        image_base64: i,
+        image_base64: n,
         source_lang: r.sourceLang,
+        reading_direction: r.readingDirection,
         use_cache: !0
       })
     });
-    return s.ok ? await s.json() : { ok: !1 };
+    return i.ok ? await i.json() : { ok: !1 };
   } catch {
     return { ok: !1 };
   }
 }
-async function G() {
-  const e = await l();
+async function J() {
+  const e = await f();
   try {
-    const a = await (await fetch(`${f(e.backendPort)}/circuit-breaker/reset`, {
+    const a = await (await fetch(`${p(e.backendPort)}/circuit-breaker/reset`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: "{}"
-    })).json(), r = await d(e.backendPort);
-    return r && await c("running", r), a;
+    })).json(), r = await g(e.backendPort);
+    return r && await u("running", r), a;
   } catch {
     return { ok: !1, message: "Motor local inacessivel." };
   }
 }
-async function b(e) {
-  const t = await S({ idleTimeoutSec: e });
+async function A(e) {
+  const t = await L({ idleTimeoutSec: e });
   try {
-    return await (await fetch(`${f(t.backendPort)}/config/idle-timeout`, {
+    return await (await fetch(`${p(t.backendPort)}/config/idle-timeout`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ idle_timeout_sec: t.idleTimeoutSec })
@@ -354,62 +431,84 @@ async function b(e) {
   }
 }
 chrome.runtime.onMessage.addListener((e, t, a) => ((async () => {
+  var r;
   switch (e.type) {
     case "GET_SETTINGS": {
-      a(await l());
+      a(await f());
       break;
     }
     case "SAVE_SETTINGS": {
-      const r = await S(e.settings);
-      typeof e.settings.idleTimeoutSec == "number" && await b(r.idleTimeoutSec);
+      const o = await L(e.settings);
+      typeof e.settings.idleTimeoutSec == "number" && await A(o.idleTimeoutSec);
       const n = await chrome.tabs.query({});
       for (const i of n)
         i.id !== void 0 && chrome.tabs.sendMessage(i.id, {
           type: "SETTINGS_UPDATED",
-          settings: r
+          settings: o
         }).catch(() => {
         });
-      a(r);
+      a(o);
+      break;
+    }
+    case "GET_GLOSSARY_STORE": {
+      a(await U());
+      break;
+    }
+    case "SAVE_GLOSSARY_STORE": {
+      const o = await B(e.store), n = await chrome.tabs.query({});
+      for (const i of n)
+        i.id !== void 0 && chrome.tabs.sendMessage(i.id, {
+          type: "GLOSSARY_UPDATED",
+          store: o
+        }).catch(() => {
+        });
+      a(o);
+      break;
+    }
+    case "CAPTURE_VISIBLE_TAB": {
+      a(await Y((r = t.tab) == null ? void 0 : r.windowId));
       break;
     }
     case "ENGINE_STATUS": {
-      a(await M());
+      a(await H());
       break;
     }
     case "ENGINE_START": {
-      a(await C());
+      a(await z());
       break;
     }
     case "ENGINE_STOP": {
-      a(await R());
+      a(await V());
       break;
     }
     case "RESET_CIRCUIT_BREAKER": {
-      a(await G());
+      a(await J());
       break;
     }
     case "UPDATE_IDLE_TIMEOUT": {
-      a(await b(e.idleTimeoutSec));
+      a(await A(e.idleTimeoutSec));
       break;
     }
     case "TRANSLATE_IMAGE_URL": {
       a(
-        await U(
+        await F(
           e.imageUrl,
           e.pageUrl,
           e.imageBase64,
-          !!e.forceRetranslate
+          !!e.forceRetranslate,
+          !!e.directOcr,
+          e.glossary
         )
       );
       break;
     }
     case "TRANSLATE_BATCH_URLS": {
-      a(await K(e.pageUrl, e.items));
+      a(await W(e.pageUrl, e.items, e.glossary));
       break;
     }
     case "PREPARE_IMAGE_URL": {
       a(
-        await D(
+        await x(
           e.imageUrl,
           e.pageUrl,
           e.imageBase64
