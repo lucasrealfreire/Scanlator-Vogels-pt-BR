@@ -278,10 +278,12 @@ def create_app(
                 "ok": True,
                 "image_sha256": prep.image_sha256,
                 "cache_hit_local": prep.cache_hit_local,
+                "busy_skipped": prep.busy_skipped,
                 "no_text": prep.no_text,
                 "blocks_count": prep.blocks_count,
                 "source_lang": prep.source_lang,
                 "detected_lang": prep.detected_lang,
+                "extraction_mode": prep.extraction_mode,
                 "timings_ms": prep.timings_ms,
             }
         except ValueError as exc:
@@ -400,6 +402,7 @@ def create_app(
         return {
             "ok": True,
             "prompt_version": PROMPT_VERSION,
+            "extraction_mode": result.extraction_mode,
             "mime_type": result.mime_type,
             "image_base64": img_b64,
             "image_sha256": result.image_sha256,
@@ -480,6 +483,7 @@ def create_app(
         return {
             "ok": True,
             "prompt_version": batch_res.prompt_version,
+            "extraction_mode": batch_res.extraction_mode,
             "model": batch_res.model,
             "source_lang": batch_res.source_lang,
             "style": batch_res.style,

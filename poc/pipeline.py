@@ -36,7 +36,13 @@ from poc.slicer import (
     should_slice_image,
     stitch_inpainted_slices,
 )
-from poc.translator import GeminiFreeTierTranslator, TranslatorProvider
+from poc.translator import (
+    EXTRACTION_MODE_MANGA_OCR,
+    EXTRACTION_MODE_VISION,
+    GeminiFreeTierTranslator,
+    TranslatorProvider,
+)
+from poc.vision_grid import build_vision_grid_sheets
 from poc.vram import (
     StageProfiler,
     get_nvidia_memory_info,
@@ -198,37 +204,55 @@ class ScanlationPipeline:
                 assert prof.metrics is not None
                 stages.append(prof.metrics)
 
-                # Stage 2: OCR (load -> recognize -> resolve reading direction -> unload!)
+                # Stage 2: OCR (ONLY for `ja`; all other languages + `auto` use Vision Grid directly!)
                 with StageProfiler("ocr") as prof:
-                    ocr_dev_req = resolve_device(
-                        self.config.device_preference,
-                        min_free_vram_mb=self.config.min_free_vram_mb,
-                    )
-                    self._ocr = create_ocr_provider(self.source_lang)
-                    used_dev = self._ocr.load(ocr_dev_req)
-                    prof.device_used = used_dev
-                    blocks = self._ocr.recognize_blocks(image_bgr, blocks)
-                    detected_lang = getattr(self._ocr, "detected_primary_language", self.source_lang)
-                    eff_dir = resolve_reading_direction(
-                        reading_direction,
-                        detected_lang=detected_lang,
-                        blocks=blocks,
-                        img_w=img_w,
-                        img_h=img_h,
-                    )
-                    blocks = sort_blocks_reading_order(
-                        blocks, direction=eff_dir, img_w=img_w, img_h=img_h
-                    )
-                    non_empty = sum(1 for b in blocks if b.source_text.strip())
-                    prof.details = {
-                        "provider": self._ocr.name,
-                        "detected_lang": detected_lang,
-                        "reading_direction": eff_dir,
-                        "blocks_recognized": non_empty,
-                    }
-                    prof.sample_peak()
-                    self._ocr.unload()
-                    self._ocr = None
+                    if self.source_lang == "ja":
+                        ocr_dev_req = resolve_device(
+                            self.config.device_preference,
+                            min_free_vram_mb=self.config.min_free_vram_mb,
+                        )
+                        self._ocr = create_ocr_provider("ja")
+                        used_dev = self._ocr.load(ocr_dev_req)
+                        prof.device_used = used_dev
+                        blocks = self._ocr.recognize_blocks(image_bgr, blocks)
+                        detected_lang = "ja"
+                        eff_dir = resolve_reading_direction(
+                            reading_direction,
+                            detected_lang=detected_lang,
+                            blocks=blocks,
+                            img_w=img_w,
+                            img_h=img_h,
+                        )
+                        blocks = sort_blocks_reading_order(
+                            blocks, direction=eff_dir, img_w=img_w, img_h=img_h
+                        )
+                        non_empty = sum(1 for b in blocks if b.source_text.strip())
+                        prof.details = {
+                            "provider": self._ocr.name,
+                            "detected_lang": detected_lang,
+                            "reading_direction": eff_dir,
+                            "blocks_recognized": non_empty,
+                        }
+                        prof.sample_peak()
+                        self._ocr.unload()
+                        self._ocr = None
+                    else:
+                        prof.device_used = "vision_grid"
+                        eff_dir = resolve_reading_direction(
+                            reading_direction,
+                            detected_lang=self.source_lang,
+                            blocks=blocks,
+                            img_w=img_w,
+                            img_h=img_h,
+                        )
+                        blocks = sort_blocks_reading_order(
+                            blocks, direction=eff_dir, img_w=img_w, img_h=img_h
+                        )
+                        prof.details = {
+                            "provider": EXTRACTION_MODE_VISION,
+                            "reading_direction": eff_dir,
+                            "blocks_detected": len(blocks),
+                        }
                 assert prof.metrics is not None
                 stages.append(prof.metrics)
 
@@ -243,74 +267,77 @@ class ScanlationPipeline:
             assert text_mask is not None
 
             # ------------------------------------------------------------------
-            # STAGE 3: MASKS & HYBRID INPAINTING (OpenCV solid + LaMa crops)
-            # Cached by image SHA-256 BEFORE translation so API retries skip GPU!
+            # STAGE 3: TRANSLATION FIRST (so empty/SFX blocks are NEVER erased!)
             # ------------------------------------------------------------------
-            cached_inpainted = cache.load_inpainted(blocks) if use_cache else None
-            if cached_inpainted is not None:
-                inpainted_bgr = cached_inpainted
-                with StageProfiler("inpainting") as prof:
-                    prof.cache_hit = True
-                    prof.device_used = "cache"
-                    prof.details = {
-                        "opencv_solid": sum(1 for b in blocks if b.inpaint_method == "opencv_solid"),
-                        "lama_crop": sum(1 for b in blocks if b.inpaint_method == "lama_crop"),
-                    }
-                assert prof.metrics is not None
-                stages.append(prof.metrics)
-            else:
-                with StageProfiler("inpainting") as prof:
-                    inp_dev_req = resolve_device(
-                        self.config.device_preference,
-                        min_free_vram_mb=self.config.min_free_vram_mb,
-                    )
-                    self._inpainter = HybridInpainter(
-                        crop_margin=self.config.inpaint_crop_margin,
-                        max_crop_side=self.config.inpaint_max_crop_side,
-                    )
-                    inpainted_bgr, used_dev, stats = self._inpainter.inpaint_page(
-                        image_bgr,
-                        text_mask,
-                        blocks,
-                        device=inp_dev_req,
-                    )
-                    prof.device_used = used_dev
-                    prof.details = dict(stats)
-                    prof.sample_peak()
-                    self._inpainter.unload()
-                    self._inpainter = None
-                assert prof.metrics is not None
-                stages.append(prof.metrics)
-                cache.save_inpainted(inpainted_bgr, blocks)
-
-            # Export detection + reading order debug image immediately
-            debug_img = create_detection_debug_image(image_bgr, blocks, text_mask)
-            write_image_png(output_dir / "debug_deteccao.png", debug_img)
-
-            # ------------------------------------------------------------------
-            # STAGE 4: GROUPED JSON TRANSLATION (Gemini Free Tier + Circuit Breaker)
-            # ------------------------------------------------------------------
+            use_vision_grid = self.source_lang != "ja"
             with StageProfiler("traducao") as prof:
                 prof.device_used = "api:gemini-free"
                 if skip_translation:
                     prof.details = {"skipped": True, "reason": "local_only_mode"}
                 else:
                     translator = self._get_translator()
-                    blocks, quota_snapshot = translator.translate_page(
-                        blocks,
-                        source_lang=self.source_lang,
-                        target_lang="pt-BR",
-                        glossary=glossary,
-                    )
+                    if use_vision_grid and hasattr(translator, "translate_page_vision"):
+                        sheets, blocks, _eff_dir = build_vision_grid_sheets(
+                            image_bgr,
+                            blocks,
+                            reading_direction=reading_direction,
+                            source_lang=self.source_lang,
+                        )
+                        blocks, quota_snapshot = translator.translate_page_vision(
+                            blocks,
+                            sheets,
+                            source_lang=self.source_lang,
+                            target_lang="pt-BR",
+                            glossary=glossary,
+                        )
+                    else:
+                        blocks, quota_snapshot = translator.translate_page(
+                            blocks,
+                            source_lang=self.source_lang,
+                            target_lang="pt-BR",
+                            glossary=glossary,
+                        )
                     translation_executed = True
                     prof.details = {
                         "model": self.config.gemini_model,
+                        "extraction_mode": EXTRACTION_MODE_VISION if use_vision_grid else EXTRACTION_MODE_MANGA_OCR,
                         "translated_blocks": sum(1 for b in blocks if b.translated_text.strip()),
                         "prompt_tokens": quota_snapshot.last_request_prompt_tokens if quota_snapshot else 0,
                         "output_tokens": quota_snapshot.last_request_output_tokens if quota_snapshot else 0,
                     }
             assert prof.metrics is not None
             stages.append(prof.metrics)
+
+            # ------------------------------------------------------------------
+            # STAGE 4: POST-TRANSLATION INPAINTING (strictly ONLY translated blocks!)
+            # ------------------------------------------------------------------
+            with StageProfiler("inpainting") as prof:
+                inp_dev_req = resolve_device(
+                    self.config.device_preference,
+                    min_free_vram_mb=self.config.min_free_vram_mb,
+                )
+                self._inpainter = HybridInpainter(
+                    crop_margin=self.config.inpaint_crop_margin,
+                    max_crop_side=self.config.inpaint_max_crop_side,
+                )
+                inpainted_bgr, used_dev, stats = self._inpainter.inpaint_page(
+                    image_bgr,
+                    text_mask,
+                    blocks,
+                    device=inp_dev_req,
+                    only_translated=translation_executed,
+                )
+                prof.device_used = used_dev
+                prof.details = dict(stats)
+                prof.sample_peak()
+                self._inpainter.unload()
+                self._inpainter = None
+            assert prof.metrics is not None
+            stages.append(prof.metrics)
+
+            # Export detection + reading order debug image immediately
+            debug_img = create_detection_debug_image(image_bgr, blocks, text_mask)
+            write_image_png(output_dir / "debug_deteccao.png", debug_img)
 
             # ------------------------------------------------------------------
             # STAGE 5: RENDERING + EXPORTS (`traduzida.png`, `comparacao.png`)

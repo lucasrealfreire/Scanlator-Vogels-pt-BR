@@ -65,19 +65,31 @@ if (!(window as unknown as { __svPtBrLoaded?: boolean }).__svPtBrLoaded) {
     return new Blob([bytes], { type: mime });
   }
 
+  function isTallWebtoonImage(img: HTMLImageElement): boolean {
+    const w = img.naturalWidth || 0;
+    const h = img.naturalHeight || 0;
+    if (w < 100 || h < 100) return false;
+    return h > 14000 || w > 14000 || (h > 2400 && h > w * 2.4);
+  }
+
   function tryCaptureCanvasBase64(img: HTMLImageElement): string | undefined {
     try {
       if (!img.complete || img.naturalWidth < 100 || img.naturalHeight < 100) return undefined;
+      // Shield tall Webtoons/Manhwas: NEVER resize or re-encode via <canvas> WebP (avoids 16,383px
+      // Chrome canvas/WebP ceiling) — let Service Worker send original raw bytes straight to slicer!
+      if (isTallWebtoonImage(img)) {
+        return undefined;
+      }
       const canvas = document.createElement("canvas");
       canvas.width = img.naturalWidth;
       canvas.height = img.naturalHeight;
       const ctx = canvas.getContext("2d");
       if (!ctx) return undefined;
       ctx.drawImage(img, 0, 0);
-      // Lightweight WebP (~8x smaller than PNG) with PNG fallback
-      let dataUrl = canvas.toDataURL("image/webp", 0.92);
+      // Lightweight WebP (0.89) with fast JPEG (0.89) fallback — never bloated multi-MB PNG!
+      let dataUrl = canvas.toDataURL("image/webp", 0.89);
       if (!dataUrl.startsWith("data:image/webp")) {
-        dataUrl = canvas.toDataURL("image/png");
+        dataUrl = canvas.toDataURL("image/jpeg", 0.89);
       }
       const comma = dataUrl.indexOf(",");
       return comma >= 0 ? dataUrl.slice(comma + 1) : undefined;
@@ -121,8 +133,13 @@ if (!(window as unknown as { __svPtBrLoaded?: boolean }).__svPtBrLoaded) {
         chapterActive
       );
     },
-    4
+    3
   );
+
+  function syncQueueBatchSize(): void {
+    // 4 pages/batch for `ja` (text JSON); 3 pages/batch for multimodal Vision Grid (`auto`/KO/ZH/EN/ES/FR)
+    queue.setMaxBatchSize(settings.sourceLang === "ja" ? 4 : 3);
+  }
 
   function sendEngineMessageWithTimeout(
     msg: RuntimeMessage,
@@ -219,6 +236,7 @@ if (!(window as unknown as { __svPtBrLoaded?: boolean }).__svPtBrLoaded) {
         settings: { sourceLang: lang },
       } satisfies RuntimeMessage)) as ExtensionSettings;
       preparedUrls.clear();
+      syncQueueBatchSize();
       panel.updateSettings(settings);
       panel.showToast(`Idioma de origem: ${lang.toUpperCase()}`);
     },
@@ -379,10 +397,12 @@ if (!(window as unknown as { __svPtBrLoaded?: boolean }).__svPtBrLoaded) {
       panel.showToast("Todas as páginas já estão traduzidas!");
       return;
     }
-    // Current visible page goes first as fast single-page; remaining pages run in 4-page batches!
+    // Current visible page goes first as fast single-page; remaining pages run in batches (3 Vision / 4 JA)!
     const visible = detector.getVisiblePage();
+    syncQueueBatchSize();
     queue.enqueueChapter(pending, visible);
-    panel.showToast(`Traduzindo capítulo (${pending.length} págs em lotes de 4)...`);
+    const batchLabel = settings.sourceLang === "ja" ? "4" : "3";
+    panel.showToast(`Traduzindo capítulo (${pending.length} págs em lotes de ${batchLabel})...`);
   }
 
   function triggerPipelinedPrepare(nextPage: DetectedMangaPage | null): void {
@@ -693,6 +713,7 @@ if (!(window as unknown as { __svPtBrLoaded?: boolean }).__svPtBrLoaded) {
       const langChanged = message.settings.sourceLang !== settings.sourceLang;
       settings = message.settings;
       if (langChanged) preparedUrls.clear();
+      syncQueueBatchSize();
       panel.updateSettings(settings);
       if (!settings.autoTranslate) {
         queue.pauseAndClearPrefetch();
@@ -744,6 +765,7 @@ if (!(window as unknown as { __svPtBrLoaded?: boolean }).__svPtBrLoaded) {
       settings = (await chrome.runtime.sendMessage({
         type: "GET_SETTINGS",
       } satisfies RuntimeMessage)) as ExtensionSettings;
+      syncQueueBatchSize();
       panel.updateSettings(settings);
 
       glossaryStore = (await chrome.runtime.sendMessage({

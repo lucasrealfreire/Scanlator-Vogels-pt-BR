@@ -55,14 +55,14 @@ export class OverlayManager {
         gap: 6px;
         padding: 4px 7px;
         border-radius: 999px;
-        background: rgba(15, 23, 42, 0.88);
-        border: 1px solid rgba(148, 163, 184, 0.35);
-        box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35);
+        background: rgba(18, 16, 18, 0.92);
+        border: 1px solid rgba(244, 196, 48, 0.42);
+        box-shadow: 0 4px 16px rgba(0, 0, 0, 0.50);
         backdrop-filter: blur(6px);
         pointer-events: auto;
         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
         font-size: 11px;
-        color: #f8fafc;
+        color: #F4EDE4;
         transition: opacity 0.14s ease;
         user-select: none;
       }
@@ -71,29 +71,50 @@ export class OverlayManager {
         display: inline-flex;
         align-items: center;
         gap: 5px;
-        padding: 2px 6px;
+        padding: 2px 7px;
         border-radius: 999px;
-        font-weight: 600;
+        font-weight: 700;
         letter-spacing: 0.02em;
       }
-      .sv-pill.loading { background: rgba(56, 189, 248, 0.22); color: #7dd3fc; }
-      .sv-pill.done { background: rgba(34, 197, 94, 0.20); color: #86efac; }
-      .sv-pill.orig { background: rgba(148, 163, 184, 0.22); color: #e2e8f0; }
-      .sv-pill.notext { background: rgba(148, 163, 184, 0.18); color: #cbd5e1; }
-      .sv-pill.error { background: rgba(239, 68, 68, 0.24); color: #fca5a5; }
+      .sv-pill.loading {
+        background: rgba(244, 196, 48, 0.22);
+        color: #FFD166;
+      }
+      .sv-pill.done {
+        background: rgba(244, 196, 48, 0.18);
+        border: 1px solid rgba(244, 196, 48, 0.38);
+        color: #FFD166;
+      }
+      .sv-pill.orig {
+        background: rgba(231, 223, 213, 0.14);
+        color: #E7DFD5;
+      }
+      .sv-pill.notext {
+        background: rgba(184, 169, 154, 0.16);
+        color: #D6C9B8;
+      }
+      .sv-pill.error {
+        background: rgba(201, 42, 42, 0.30);
+        color: #FCA5A5;
+      }
       .sv-btn {
         appearance: none;
-        border: 1px solid rgba(148, 163, 184, 0.32);
-        background: rgba(30, 41, 59, 0.92);
-        color: #f8fafc;
+        border: 1px solid rgba(244, 196, 48, 0.35);
+        background: #1B1618;
+        color: #F4EDE4;
         border-radius: 999px;
         padding: 3px 9px;
         font-size: 11px;
-        font-weight: 600;
+        font-weight: 700;
         cursor: pointer;
         line-height: 1.2;
+        transition: background-color 0.14s ease, border-color 0.14s ease, color 0.14s ease;
       }
-      .sv-btn:hover { background: rgba(56, 189, 248, 0.28); border-color: #38bdf8; }
+      .sv-btn:hover {
+        background: rgba(201, 42, 42, 0.30);
+        border-color: #F4C430;
+        color: #FFD166;
+      }
     `;
     this.layerEl = document.createElement("div");
     this.shadow.append(style, this.layerEl);

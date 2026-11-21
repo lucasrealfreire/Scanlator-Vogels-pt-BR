@@ -84,26 +84,60 @@ def _pad_to_modulo(arr: np.ndarray, mod: int = 8, is_mask: bool = False) -> tupl
 def _classify_region_background(
     crop_bgr: np.ndarray,
     dilated_mask: np.ndarray,
+    *,
+    raw_text_mask: Optional[np.ndarray] = None,
+    inner_box: Optional[tuple[int, int, int, int]] = None,
 ) -> tuple[bool, bool, tuple[int, int, int]]:
-    """Inspect the pixel ring immediately surrounding the text mask.
+    """Sample background strictly INSIDE the bubble interior (NEVER leaking to outer dark panels!).
 
-    Returns `(is_solid_bubble, is_smooth_gradient, median_bgr)`:
-    - `is_solid_bubble=True`: uniform flat fill (white, black, colored bubble, or flat RPG
-      system box) — cleaned cleanly with its true sampled `median_bgr` (NEVER hardcoded white!).
-    - `is_smooth_gradient=True`: smooth color gradient without complex lineart — cleaned
-      instantly via OpenCV Telea inpainting preserving the exact gradient with 0 MB VRAM.
-    - Both False: complex textured artwork — deferred to local LaMa crop (or Telea fallback).
+    Key guarantees (v1.2):
+    - Samples non-text pixels STRICTLY inside `inner_box` (the bubble's own interior where
+      `raw_text_mask == 0`, falling back to `dilated_mask == 0` inside `inner_box`) so a white
+      speech bubble touching a black blackboard NEVER samples the blackboard!
+    - Classifies a bubble as dark ONLY when **> 65%** of interior non-text pixels have
+      luminance `< 95.0`. Otherwise discards dark border outliers (`lum < 95`) so white/light
+      bubbles stay spotless white/pastel.
+    - Uses solid fill ONLY when interior background variance is genuinely uniform (`inlier_ratio >= 0.78`,
+      `std_color <= 12.0`, `gradient_diff <= 14.0`). Gradients, translucent RPG boxes, and
+      colored art backgrounds return `is_solid=False` and route to local Telea/NS or LaMa!
     """
-    ring_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (17, 17))
-    outer = cv2.dilate(dilated_mask, ring_kernel, iterations=1)
-    ring = cv2.subtract(outer, dilated_mask)
-    ring_ys, ring_xs = np.nonzero(ring > 127)
+    ch, cw = crop_bgr.shape[:2]
+    text_exclusion = raw_text_mask if raw_text_mask is not None else dilated_mask
 
-    if ring_ys.size < 20:
+    # Build strict interior sampling region inside the block's own bbox (eroded slightly from outer panel edges)
+    if inner_box is not None:
+        ix1, iy1, ix2, iy2 = inner_box
+        ix1 = max(0, min(cw - 1, ix1))
+        iy1 = max(0, min(ch - 1, iy1))
+        ix2 = max(ix1 + 1, min(cw, ix2))
+        iy2 = max(iy1 + 1, min(ch, iy2))
+        interior_region = np.zeros((ch, cw), dtype=np.uint8)
+        interior_region[iy1:iy2, ix1:ix2] = 255
+
+        # Prefer strictly un-masked interior pixels inside the bubble bbox (NEVER outside!)
+        bg_mask = (interior_region > 127) & (text_exclusion <= 127)
+        if int(np.count_nonzero(bg_mask)) < 24:
+            # Tiny single-word bubble: allow a tight 4px interior margin (still never 17px outer leak!)
+            tight_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+            expanded = cv2.dilate(interior_region, tight_k, iterations=1)
+            bg_mask = (expanded > 127) & (text_exclusion <= 127)
+    else:
+        # Fallback for direct unit calls without `inner_box`: tight 7px ring around dilated_mask
+        ring_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
+        outer = cv2.dilate(dilated_mask, ring_kernel, iterations=1)
+        bg_mask = cv2.subtract(outer, dilated_mask) > 127
+
+    ring_ys, ring_xs = np.nonzero(bg_mask)
+    if ring_ys.size < 16:
+        # Last-resort fallback: sample non-text pixels anywhere in crop
+        bg_mask = text_exclusion <= 127
+        ring_ys, ring_xs = np.nonzero(bg_mask)
+
+    if ring_ys.size < 12:
         fallback_med = np.median(crop_bgr.reshape(-1, 3), axis=0)
         return (
             False,
-            False,
+            True,
             (
                 int(np.clip(round(float(fallback_med[0])), 0, 255)),
                 int(np.clip(round(float(fallback_med[1])), 0, 255)),
@@ -113,34 +147,50 @@ def _classify_region_background(
 
     ring_pixels = crop_bgr[ring_ys, ring_xs]
     ring_f = ring_pixels.astype(np.float32)
+    lum = 0.114 * ring_f[:, 0] + 0.587 * ring_f[:, 1] + 0.299 * ring_f[:, 2]
 
-    # Robust dominant-color clustering around the ring median (works identically for
-    # white bubbles, black bubbles, pastel/colored bubbles, and dark RPG system boxes
-    # while ignoring thin contrasting borders touching the ring!)
-    raw_med = np.median(ring_f, axis=0)
-    raw_dists = np.linalg.norm(ring_f - raw_med, axis=1)
-    inlier_mask = raw_dists <= 28.0
+    # Strict rule: dark bubble ONLY when > 65% of interior non-text pixels have luminance < 95!
+    dark_ratio = float(np.mean(lum < 95.0))
+    is_dark_interior = dark_ratio > 0.65
+
+    if is_dark_interior:
+        # Keep genuine dark interior pixels, discarding bright outline/white-ink halos
+        cand = ring_f[lum < 120.0]
+        cand_ys, cand_xs = ring_ys[lum < 120.0], ring_xs[lum < 120.0]
+    else:
+        # Keep non-black interior pixels so thin black bubble outlines / touching blackboards are NEVER sampled!
+        light_sel = lum >= 95.0
+        if int(np.count_nonzero(light_sel)) >= 12:
+            cand = ring_f[light_sel]
+            cand_ys, cand_xs = ring_ys[light_sel], ring_xs[light_sel]
+        else:
+            cand = ring_f
+            cand_ys, cand_xs = ring_ys, ring_xs
+
+    raw_med = np.median(cand, axis=0)
+    raw_dists = np.linalg.norm(cand - raw_med, axis=1)
+    inlier_mask = raw_dists <= 24.0
     inlier_ratio = float(np.mean(inlier_mask))
 
-    if int(np.count_nonzero(inlier_mask)) >= 16:
-        clean_pixels = ring_f[inlier_mask]
+    if int(np.count_nonzero(inlier_mask)) >= 12:
+        clean_pixels = cand[inlier_mask]
     else:
-        clean_pixels = ring_f
+        clean_pixels = cand
 
     median_bgr = np.median(clean_pixels, axis=0)
     inlier_dists = np.linalg.norm(clean_pixels - median_bgr, axis=1)
-    within_tol = float(np.mean(inlier_dists <= 18.0))
+    within_tol = float(np.mean(inlier_dists <= 16.0))
     std_color = float(np.sqrt(np.mean(np.var(clean_pixels, axis=0))))
 
-    # Detect color gradients across the ring (top vs bottom, left vs right)
+    # Spatial gradient check strictly across interior background pixels (top vs bottom, left vs right)
     gradient_diff = 0.0
-    if ring_ys.size >= 40:
-        mid_y = float(np.median(ring_ys))
-        mid_x = float(np.median(ring_xs))
-        top_px = ring_f[ring_ys <= mid_y]
-        bot_px = ring_f[ring_ys > mid_y]
-        left_px = ring_f[ring_xs <= mid_x]
-        right_px = ring_f[ring_xs > mid_x]
+    if cand_ys.size >= 32:
+        mid_y = float(np.median(cand_ys))
+        mid_x = float(np.median(cand_xs))
+        top_px = cand[cand_ys <= mid_y]
+        bot_px = cand[cand_ys > mid_y]
+        left_px = cand[cand_xs <= mid_x]
+        right_px = cand[cand_xs > mid_x]
         if top_px.shape[0] >= 8 and bot_px.shape[0] >= 8:
             gradient_diff = max(
                 gradient_diff,
@@ -153,27 +203,27 @@ def _classify_region_background(
             )
 
     is_solid = (
-        inlier_ratio >= 0.72
+        inlier_ratio >= 0.78
         and within_tol >= 0.85
-        and std_color <= 13.0
-        and gradient_diff <= 16.0
+        and std_color <= 12.0
+        and gradient_diff <= 14.0
     )
 
-    # Smooth gradient check: high spatial color drift, but low local high-frequency edge texture
-    is_smooth_gradient = False
-    if not is_solid and gradient_diff > 16.0:
+    # Smooth gradient / translucent RPG system box check -> fast OpenCV Telea (0 MB VRAM, preserves gradient!)
+    use_telea = False
+    if not is_solid:
         gray_crop = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
         lap = np.abs(cv2.Laplacian(gray_crop, cv2.CV_32F, ksize=3))
-        ring_edge_energy = float(np.mean(lap[ring_ys, ring_xs]))
-        if ring_edge_energy < 14.0 and std_color <= 26.0:
-            is_smooth_gradient = True
+        edge_energy = float(np.mean(lap[cand_ys, cand_xs])) if cand_ys.size > 0 else 99.0
+        if edge_energy < 20.0:
+            use_telea = True
 
     med_tuple = (
         int(np.clip(round(float(median_bgr[0])), 0, 255)),
         int(np.clip(round(float(median_bgr[1])), 0, 255)),
         int(np.clip(round(float(median_bgr[2])), 0, 255)),
     )
-    return is_solid, is_smooth_gradient, med_tuple
+    return is_solid, use_telea, med_tuple
 
 
 def _extract_block_local_mask(
@@ -181,52 +231,48 @@ def _extract_block_local_mask(
     block: TextBlock,
     crop_box: BoundingBox,
     img_bgr: np.ndarray,
-) -> np.ndarray:
-    """Build a crisp dilated mask for one block inside `crop_box`, avoiding bubble borders."""
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return `(dilated_mask, raw_text_mask)` strictly inside `crop_box` without touching outer borders."""
     ch = crop_box.height
     cw = crop_box.width
-    local_mask = np.zeros((ch, cw), dtype=np.uint8)
+    raw_mask = np.zeros((ch, cw), dtype=np.uint8)
 
-    # Restrict mask collection to the block's bbox (with slight 4px expansion for furigana/edges)
-    bx1 = max(crop_box.x1, block.bbox.x1 - 4) - crop_box.x1
-    by1 = max(crop_box.y1, block.bbox.y1 - 4) - crop_box.y1
-    bx2 = min(crop_box.x2, block.bbox.x2 + 4) - crop_box.x1
-    by2 = min(crop_box.y2, block.bbox.y2 + 4) - crop_box.y1
+    bx1 = max(crop_box.x1, block.bbox.x1 - 3) - crop_box.x1
+    by1 = max(crop_box.y1, block.bbox.y1 - 3) - crop_box.y1
+    bx2 = min(crop_box.x2, block.bbox.x2 + 3) - crop_box.x1
+    by2 = min(crop_box.y2, block.bbox.y2 + 3) - crop_box.y1
 
     sub_global = global_mask[crop_box.y1 : crop_box.y2, crop_box.x1 : crop_box.x2]
     if sub_global.size > 0 and bx2 > bx1 and by2 > by1:
-        local_mask[by1:by2, bx1:bx2] = np.where(
+        raw_mask[by1:by2, bx1:bx2] = np.where(
             sub_global[by1:by2, bx1:bx2] > 100, 255, 0
         ).astype(np.uint8)
 
-    # Also include line polygons if the pixel mask missed tiny punctuation/furigana
-    for poly in block.lines:
-        pts = np.array(
-            [[pt[0] - crop_box.x1, pt[1] - crop_box.y1] for pt in poly],
-            dtype=np.int32,
-        )
-        if pts.shape[0] >= 3:
-            cv2.fillPoly(local_mask, [pts], 255)
+    # Include DBNet line polygons ONLY if global pixel mask missed strokes inside the polygon
+    if int(np.count_nonzero(raw_mask)) < 24:
+        for poly in block.lines:
+            pts = np.array(
+                [[pt[0] - crop_box.x1, pt[1] - crop_box.y1] for pt in poly],
+                dtype=np.int32,
+            )
+            if pts.shape[0] >= 3:
+                cv2.fillPoly(raw_mask, [pts], 255)
 
     # Fallback if neither mask nor lines fired inside bbox:
-    # Detect ink contrasting with the crop border (works for dark text on light AND white text on dark/colored!)
-    if int(np.count_nonzero(local_mask)) < 16 and bx2 > bx1 and by2 > by1:
+    # Detect ink contrasting with interior median (works on dark-on-light AND light-on-dark!)
+    if int(np.count_nonzero(raw_mask)) < 16 and bx2 > bx1 and by2 > by1:
         sub_img = img_bgr[
             crop_box.y1 + by1 : crop_box.y1 + by2,
             crop_box.x1 + bx1 : crop_box.x1 + bx2,
         ].astype(np.float32)
-        border_px = np.concatenate(
-            [sub_img[0, :], sub_img[-1, :], sub_img[:, 0], sub_img[:, -1]],
-            axis=0,
-        )
-        bg_med = np.median(border_px, axis=0)
+        bg_med = np.median(sub_img.reshape(-1, 3), axis=0)
         color_dist = np.linalg.norm(sub_img - bg_med, axis=2)
-        local_mask[by1:by2, bx1:bx2] = np.where(color_dist > 38.0, 255, 0).astype(np.uint8)
+        raw_mask[by1:by2, bx1:bx2] = np.where(color_dist > 38.0, 255, 0).astype(np.uint8)
 
-    # Slightly dilate to fully erase anti-aliased ink halos around strokes
+    # Dilate slightly to cleanly erase anti-aliased ink halos, clipped strictly near block bbox
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-    dilated = cv2.dilate(local_mask, kernel, iterations=1)
-    return dilated
+    dilated = cv2.dilate(raw_mask, kernel, iterations=1)
+    return dilated, raw_mask
 
 
 def extract_solid_bubble_safe_mask(
@@ -581,10 +627,13 @@ class HybridInpainter:
         *,
         device: str = "cuda",
         force_lama_for_complex: bool = True,
+        only_translated: bool = False,
+        keep_lama_warm: bool = False,
     ) -> tuple[np.ndarray, str, dict[str, int]]:
-        """Clean every detected text block using hybrid OpenCV (solid) + LaMa (complex crops).
+        """Clean detected text blocks using strict interior sampling + Telea/NS + LaMa crops.
 
-        Returns `(cleaned_bgr, device_used, stats)`.
+        When `only_translated=True`, blocks with empty `translated_text` are NEVER erased,
+        keeping 100% of original art/SFX intact!
         """
         img_h, img_w = image_bgr.shape[:2]
         cleaned = image_bgr.copy()
@@ -594,29 +643,40 @@ class HybridInpainter:
         skipped_count = 0
 
         for block in blocks:
+            if only_translated and not block.translated_text.strip():
+                block.inpaint_method = "skipped"
+                skipped_count += 1
+                continue
+
             crop_box = block.bbox.padded(self.crop_margin, img_w, img_h)
             if crop_box.width < 8 or crop_box.height < 8:
                 block.inpaint_method = "skipped"
                 skipped_count += 1
                 continue
 
-            local_mask = _extract_block_local_mask(global_mask, block, crop_box, cleaned)
+            local_mask, raw_mask = _extract_block_local_mask(global_mask, block, crop_box, cleaned)
             if int(np.count_nonzero(local_mask)) == 0:
                 block.inpaint_method = "skipped"
                 skipped_count += 1
                 continue
 
             crop_bgr = cleaned[crop_box.y1 : crop_box.y2, crop_box.x1 : crop_box.x2]
-            is_solid, is_smooth_gradient, median_bgr = _classify_region_background(
-                crop_bgr, local_mask
+            inner_box = (
+                block.bbox.x1 - crop_box.x1,
+                block.bbox.y1 - crop_box.y1,
+                block.bbox.x2 - crop_box.x1,
+                block.bbox.y2 - crop_box.y1,
+            )
+            is_solid, use_telea, median_bgr = _classify_region_background(
+                crop_bgr,
+                local_mask,
+                raw_text_mask=raw_mask,
+                inner_box=inner_box,
             )
 
             if is_solid:
-                # Fast, spotless OpenCV cleaning using the TRUE sampled background color
-                # (preserves white, black, pastel/colored bubbles, and dark RPG system boxes!)
                 fill_layer = np.empty_like(crop_bgr)
                 fill_layer[:, :] = median_bgr
-                # Soft 1px feathering on edges for anti-aliased blending
                 alpha = cv2.GaussianBlur(local_mask.astype(np.float32) / 255.0, (3, 3), 0)
                 alpha = np.clip(alpha * 1.15, 0.0, 1.0)[..., None]
                 blended = (
@@ -631,8 +691,8 @@ class HybridInpainter:
                 block.is_solid_bubble = True
                 block.bubble_bg_rgb = (median_bgr[2], median_bgr[1], median_bgr[0])
                 opencv_count += 1
-            elif is_smooth_gradient or not force_lama_for_complex:
-                # Preserve color gradients / colored system boxes cleanly via local Telea (0 MB VRAM!)
+            elif use_telea or not force_lama_for_complex:
+                # Preserve gradients, translucent RPG boxes, and colored backgrounds via local Telea (0 MB VRAM!)
                 inpainted_crop = cv2.inpaint(crop_bgr, local_mask, 5, cv2.INPAINT_TELEA)
                 alpha = cv2.GaussianBlur(local_mask.astype(np.float32) / 255.0, (3, 3), 0)
                 alpha = np.clip(alpha * 1.15, 0.0, 1.0)[..., None]
@@ -649,12 +709,11 @@ class HybridInpainter:
                 block.bubble_bg_rgb = (median_bgr[2], median_bgr[1], median_bgr[0])
                 opencv_count += 1
             else:
-                # Defer to local LaMa crop batch so LaMa loads once and unloads right after
                 block.is_solid_bubble = False
                 block.bubble_bg_rgb = (median_bgr[2], median_bgr[1], median_bgr[0])
                 lama_queue.append((block, crop_box, local_mask))
 
-        # Run LaMa strictly on complex crops, then immediately unload from VRAM
+        # Run LaMa strictly on complex textured crops (only kept warm if explicitly requested by warm server)
         used_device = "cpu"
         if lama_queue:
             used_device = self._load_lama(device)
@@ -663,7 +722,6 @@ class HybridInpainter:
                     crop_bgr = cleaned[crop_box.y1 : crop_box.y2, crop_box.x1 : crop_box.x2]
                     inpainted_crop = self._run_lama_on_crop(crop_bgr, local_mask)
 
-                    # Composite ONLY the masked pixels so 100% of external artwork is untouched
                     alpha = cv2.GaussianBlur(local_mask.astype(np.float32) / 255.0, (5, 5), 0)
                     alpha = np.clip(alpha * 1.2, 0.0, 1.0)[..., None]
                     composited = (
@@ -677,10 +735,12 @@ class HybridInpainter:
                     lama_count += 1
                 used_device = self._lama_device
             finally:
-                self.unload()
+                if not keep_lama_warm:
+                    self.unload()
 
-        # Compute optimal safe rendering boxes on the cleaned page
-        for block in blocks:
+        # Compute optimal safe rendering boxes ONLY on inpainted blocks
+        active_blocks = [b for b in blocks if b.inpaint_method != "skipped"]
+        for block in active_blocks:
             if block.is_solid_bubble:
                 med_bgr = (
                     block.bubble_bg_rgb[2],
@@ -688,11 +748,9 @@ class HybridInpainter:
                     block.bubble_bg_rgb[0],
                 )
                 block.render_bbox = _compute_solid_bubble_render_bbox(
-                    cleaned, block, blocks, med_bgr
+                    cleaned, block, active_blocks, med_bgr
                 )
             else:
-                # Over complex artwork: keep centered tightly around original text area
-                # with a small horizontal breathability margin for Portuguese words
                 pad_x = min(14, max(4, int(block.bbox.width * 0.12)))
                 pad_y = min(8, max(2, int(block.bbox.height * 0.05)))
                 block.render_bbox = BoundingBox(

@@ -37,6 +37,8 @@ logger = logging.getLogger(__name__)
 # Bumped whenever translation prompt/style changes so IndexedDB/translation caches refresh
 # WITHOUT invalidating local SHA-256 detection/OCR/inpainting caches.
 PROMPT_VERSION: str = "v3-scanlation-turbo"
+EXTRACTION_MODE_VISION: str = "vision_grid_v1"
+EXTRACTION_MODE_MANGA_OCR: str = "manga_ocr_v1"
 
 STYLE_TEMPERATURES: dict[str, float] = {
     "scanlation": 0.50,
@@ -202,6 +204,21 @@ def build_system_prompt(style: str = "scanlation") -> str:
     return f"{SCANLATION_SYSTEM_PROMPT}\n{style_note}\n"
 
 
+VISION_GRID_RULES = """
+REGRAS ESPECÍFICAS DA GRADE MULTIMODAL DE BALÕES:
+- Você receberá uma ou mais imagens em grade com células numeradas em ordem cronológica de leitura (`[1]`, `[2]`, `[3]`... ou `[P0-1]`, `[P1-1]` em lote).
+- Leia diretamente o texto original dentro de cada célula — qualquer idioma (Coreano/Hangul, Chinês horizontal ou vertical direita→esquerda, Japonês, Inglês, Espanhol, Francês ou misto) — e traduza diretamente para Scanlation PT-BR natural seguindo TODAS as regras acima.
+- REGRA CRÍTICA ANTI-ALUCINAÇÃO (NUNCA INVENTE TEXTO):
+  * Se uma célula contiver APENAS arte/cenário sem texto legível, ruído, borrado ilegível, logo/marca d'água/crédito decorativo, ou onomatopeia/SFX estilizada que NÃO deve apagar a arte, retorne `""` (string vazia) para aquele ID!
+  * JAMAIS invente códigos, números ou palavras aleatórias quando não houver fala legível.
+- Se uma célula contiver APENAS pontuação pura (`...`, `?!`, `!!`, `…!`), retorne a pontuação normalizada (`...`, `?!`, `!!`, `...!`).
+"""
+
+
+def build_vision_system_prompt(style: str = "scanlation") -> str:
+    return f"{build_system_prompt(style)}\n{VISION_GRID_RULES}\n"
+
+
 def has_glued_words(text: str) -> bool:
     """Detect malformed glued output lacking spaces (e.g. `JAMAISTENTEMRESOLVERISSOZINHOS`).
 
@@ -283,6 +300,10 @@ def _format_glossary_section(glossary: Optional[dict[str, str]]) -> str:
     return "\n".join(lines)
 
 
+_CONTROL_CHAR_STRIP_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_BATCH_PAGE_KEY_RE = re.compile(r'"([pP]\d+)"\s*:\s*\{')
+
+
 def _strip_json_fences(raw: str) -> str:
     text = raw.strip()
     if text.startswith("```"):
@@ -291,13 +312,86 @@ def _strip_json_fences(raw: str) -> str:
     return text.strip()
 
 
-def _parse_lean_single_page_json(raw_text: str) -> dict[int, str]:
+def _clean_translated_text(text: str) -> str:
+    """Remove invalid ASCII control chars, normalize line breaks/tabs, and collapse spaces."""
+    if not text:
+        return ""
+    cleaned = _CONTROL_CHAR_STRIP_RE.sub("", text)
+    cleaned = cleaned.replace("\r", " ").replace("\n", " ").replace("\t", " ")
+    return re.sub(r" {2,}", " ", cleaned).strip()
+
+
+def _sanitize_json_response(raw: str) -> str:
+    """Strip markdown fences and sanitize ASCII control chars (`\\x00`-`\\x1f`, `\\x7f`).
+
+    - Outside JSON string literals: keeps valid JSON whitespace (` `, `\\n`, `\\r`, `\\t`) and
+      strips invalid ASCII control characters.
+    - Inside JSON string literals: normalizes literal line breaks (`\\n`, `\\r`) and tabs (`\\t`)
+      to spaces and strips other invalid ASCII control characters so `json.loads(..., strict=False)`
+      accepts responses where Gemini emitted literal newlines/tabs inside dialogue values.
+    """
+    text = _strip_json_fences(raw)
+    if not text:
+        return ""
+
+    out: list[str] = []
+    in_string = False
+    escaped = False
+    for ch in text:
+        code = ord(ch)
+        if in_string:
+            if escaped:
+                if code < 0x20 or code == 0x7F:
+                    out.append(" ")
+                else:
+                    out.append(ch)
+                escaped = False
+                continue
+            if ch == "\\":
+                out.append(ch)
+                escaped = True
+                continue
+            if ch == '"':
+                out.append(ch)
+                in_string = False
+                continue
+            if ch in ("\n", "\r", "\t"):
+                out.append(" ")
+                continue
+            if code < 0x20 or code == 0x7F:
+                continue
+            out.append(ch)
+        else:
+            if ch == '"':
+                in_string = True
+                out.append(ch)
+            elif ch in ("\n", "\r", "\t") or (code >= 0x20 and code != 0x7F):
+                out.append(ch)
+    return "".join(out).strip()
+
+
+def _normalize_page_id_map(obj: dict[Any, Any]) -> dict[int, str]:
+    result: dict[int, str] = {}
+    for k, v in obj.items():
+        try:
+            bid = int(str(k).strip().lstrip("#"))
+        except ValueError:
+            continue
+        if isinstance(v, str):
+            result[bid] = _clean_translated_text(v)
+        elif isinstance(v, dict):
+            txt = v.get("pt_br") or v.get("text") or ""
+            result[bid] = _clean_translated_text(str(txt))
+    return result
+
+
+def _parse_lean_single_page_json(raw_text: str, *, allow_empty: bool = False) -> dict[int, str]:
     """Parse ultra-lean `{"1": "FALA", "2": "FALA"}` (with defensive fallback for nested formats)."""
-    cleaned = _strip_json_fences(raw_text)
+    cleaned = _sanitize_json_response(raw_text)
     if not cleaned:
         raise InvalidJSONResponseError("Gemini retornou resposta vazia.")
     try:
-        obj = json.loads(cleaned)
+        obj = json.loads(cleaned, strict=False)
     except (json.JSONDecodeError, ValueError) as exc:
         raise InvalidJSONResponseError(
             f"JSON invalido retornado pelo Gemini: {exc}. Trecho: {cleaned[:260]}",
@@ -315,7 +409,7 @@ def _parse_lean_single_page_json(raw_text: str) -> dict[int, str]:
         for item in obj["translations"]:
             if isinstance(item, dict) and "id" in item:
                 txt = item.get("pt_br") or item.get("text") or item.get("translation") or ""
-                mapped[int(item["id"])] = str(txt).strip()
+                mapped[int(item["id"])] = _clean_translated_text(str(txt))
         return mapped
 
     if len(obj) == 1:
@@ -323,18 +417,8 @@ def _parse_lean_single_page_json(raw_text: str) -> dict[int, str]:
         if isinstance(only_val, dict):
             obj = only_val
 
-    result: dict[int, str] = {}
-    for k, v in obj.items():
-        try:
-            bid = int(str(k).strip().lstrip("#"))
-        except ValueError:
-            continue
-        if isinstance(v, str):
-            result[bid] = v.strip()
-        elif isinstance(v, dict):
-            txt = v.get("pt_br") or v.get("text") or ""
-            result[bid] = str(txt).strip()
-    if not result:
+    result = _normalize_page_id_map(obj)
+    if not result and not allow_empty:
         raise InvalidJSONResponseError(
             f"JSON do Gemini nao contem pares id->traducao validos. Trecho: {cleaned[:260]}"
         )
@@ -343,11 +427,11 @@ def _parse_lean_single_page_json(raw_text: str) -> dict[int, str]:
 
 def _parse_lean_batch_json(raw_text: str) -> dict[str, dict[int, str]]:
     """Parse ultra-lean multi-page JSON `{"p0": {"1": "FALA"}, "p1": {"1": "FALA"}}`."""
-    cleaned = _strip_json_fences(raw_text)
+    cleaned = _sanitize_json_response(raw_text)
     if not cleaned:
         raise InvalidJSONResponseError("Gemini retornou resposta vazia no lote.")
     try:
-        obj = json.loads(cleaned)
+        obj = json.loads(cleaned, strict=False)
     except (json.JSONDecodeError, ValueError) as exc:
         raise InvalidJSONResponseError(
             f"JSON de lote invalido retornado pelo Gemini: {exc}. Trecho: {cleaned[:260]}",
@@ -367,18 +451,58 @@ def _parse_lean_batch_json(raw_text: str) -> dict[str, dict[int, str]]:
     for page_key, page_val in obj.items():
         if not isinstance(page_val, dict):
             continue
-        page_map: dict[int, str] = {}
-        for k, v in page_val.items():
-            try:
-                bid = int(str(k).strip().lstrip("#"))
-            except ValueError:
-                continue
-            if isinstance(v, str):
-                page_map[bid] = v.strip()
-            elif isinstance(v, dict):
-                page_map[bid] = str(v.get("pt_br") or v.get("text") or "").strip()
-        parsed_pages[str(page_key)] = page_map
+        parsed_pages[str(page_key)] = _normalize_page_id_map(page_val)
     return parsed_pages
+
+
+def _recover_valid_pages_from_corrupt_batch_json(raw_text: str) -> dict[str, dict[int, str]]:
+    """Best-effort extraction of intact `"pN": {...}` sub-objects from a corrupt/truncated batch JSON.
+
+    Allows batch translation to keep every intact page and trigger isolated per-page fallback
+    ONLY for the damaged/truncated page(s), never aborting the entire batch prematurely.
+    """
+    cleaned = _sanitize_json_response(raw_text)
+    if not cleaned:
+        return {}
+
+    recovered: dict[str, dict[int, str]] = {}
+    n = len(cleaned)
+    for match in _BATCH_PAGE_KEY_RE.finditer(cleaned):
+        page_key = match.group(1)
+        brace_start = match.end() - 1
+        depth = 0
+        in_str = False
+        esc = False
+        brace_end = -1
+        for pos in range(brace_start, n):
+            ch = cleaned[pos]
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+            else:
+                if ch == '"':
+                    in_str = True
+                elif ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        brace_end = pos + 1
+                        break
+        if brace_end == -1:
+            continue
+        candidate = cleaned[brace_start:brace_end]
+        try:
+            page_obj = json.loads(candidate, strict=False)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(page_obj, dict):
+            recovered[page_key] = _normalize_page_id_map(page_obj)
+    return recovered
 
 
 def _is_thinking_config_rejection(exc: BaseException) -> bool:
@@ -485,14 +609,14 @@ class GeminiFreeTierTranslator(TranslatorProvider):
                 kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
         return types.GenerateContentConfig(**kwargs)
 
-    def _call_gemini_json(
+    def _call_gemini_contents_json(
         self,
         *,
-        user_prompt: str,
+        contents: Any,
         system_prompt: str,
         temperature: float,
     ):
-        """Invoke Gemini once under CircuitBreaker with zero-thinking config + graceful fallback."""
+        """Invoke Gemini once under CircuitBreaker (text or multimodal parts) with zero-thinking fallback."""
         client = self._get_client()
         modes = _thinking_fallback_chain(self.model) if self.disable_thinking else ["none"]
 
@@ -504,7 +628,7 @@ class GeminiFreeTierTranslator(TranslatorProvider):
             )
             return client.models.generate_content(
                 model=self.model,
-                contents=user_prompt,
+                contents=contents,
                 config=cfg,
             )
 
@@ -529,6 +653,19 @@ class GeminiFreeTierTranslator(TranslatorProvider):
                 raise
         assert last_exc is not None
         raise last_exc
+
+    def _call_gemini_json(
+        self,
+        *,
+        user_prompt: str,
+        system_prompt: str,
+        temperature: float,
+    ):
+        return self._call_gemini_contents_json(
+            contents=user_prompt,
+            system_prompt=system_prompt,
+            temperature=temperature,
+        )
 
     def _repair_glued_blocks_if_needed(
         self,
@@ -565,7 +702,7 @@ class GeminiFreeTierTranslator(TranslatorProvider):
             for b in glued:
                 fixed = fixed_map.get(b.id, "")
                 if fixed and not has_glued_words(fixed):
-                    b.translated_text = re.sub(r"[ \t]{2,}", " ", fixed).strip()
+                    b.translated_text = _clean_translated_text(fixed)
             usage = getattr(resp, "usage_metadata", None)
             return (
                 int(getattr(usage, "prompt_token_count", 0) or 0),
@@ -619,7 +756,7 @@ class GeminiFreeTierTranslator(TranslatorProvider):
             for blk in still_needed:
                 val = fixed_map.get(blk.id, "").strip()
                 if val:
-                    blk.translated_text = re.sub(r"[ \t]{2,}", " ", val).strip()
+                    blk.translated_text = _clean_translated_text(val)
             usage = getattr(resp, "usage_metadata", None)
             prompt_tok = int(getattr(usage, "prompt_token_count", 0) or 0)
             output_tok = int(getattr(usage, "candidates_token_count", 0) or 0)
@@ -676,7 +813,7 @@ class GeminiFreeTierTranslator(TranslatorProvider):
             temperature=temperature,
         )
         raw_text = (getattr(response, "text", None) or "").strip()
-        by_id = _parse_lean_single_page_json(raw_text)
+        by_id = _parse_lean_single_page_json(raw_text, allow_empty=False)
 
         usage = getattr(response, "usage_metadata", None)
         prompt_tokens = int(getattr(usage, "prompt_token_count", 0) or 0)
@@ -686,7 +823,7 @@ class GeminiFreeTierTranslator(TranslatorProvider):
         for block in translatable:
             translated = by_id.get(block.id, "").strip()
             if translated:
-                block.translated_text = re.sub(r"[ \t]{2,}", " ", translated).strip()
+                block.translated_text = _clean_translated_text(translated)
             else:
                 missing_blocks.append(block)
 
@@ -788,7 +925,16 @@ class GeminiFreeTierTranslator(TranslatorProvider):
             temperature=temperature,
         )
         raw_text = (getattr(response, "text", None) or "").strip()
-        parsed_batch = _parse_lean_batch_json(raw_text)
+        try:
+            parsed_batch = _parse_lean_batch_json(raw_text)
+        except InvalidJSONResponseError as parse_exc:
+            parsed_batch = _recover_valid_pages_from_corrupt_batch_json(raw_text)
+            logger.warning(
+                "JSON de lote corrompido/truncado (%s); paginas recuperadas=%s — "
+                "acionando fallback isolado apenas para as demais.",
+                parse_exc,
+                sorted(parsed_batch.keys()),
+            )
 
         usage = getattr(response, "usage_metadata", None)
         prompt_tokens = int(getattr(usage, "prompt_token_count", 0) or 0)
@@ -801,7 +947,9 @@ class GeminiFreeTierTranslator(TranslatorProvider):
         for idx in non_empty_indices:
             pkey = f"p{idx}"
             translatable = translatable_by_page[idx]
-            page_map = parsed_batch.get(pkey) or {}
+            page_map = parsed_batch.get(pkey)
+            if page_map is None:
+                page_map = parsed_batch.get(f"P{idx}")
             if not page_map:
                 logger.warning(
                     "Lote omitiu pagina inteira %s; acionando fallback isolado.",
@@ -814,7 +962,7 @@ class GeminiFreeTierTranslator(TranslatorProvider):
             for b in translatable:
                 val = page_map.get(b.id, "").strip()
                 if val:
-                    b.translated_text = re.sub(r"[ \t]{2,}", " ", val).strip()
+                    b.translated_text = _clean_translated_text(val)
                     all_translated_ok.append(b)
                 else:
                     page_missing.append(b)
@@ -871,6 +1019,225 @@ class GeminiFreeTierTranslator(TranslatorProvider):
 
         fallback_pages_all = sorted(set(full_fallback_pages) | set(partial_missing_by_page.keys()))
         return pages_blocks, quota_snap, fallback_pages_all
+
+    def translate_page_vision(
+        self,
+        blocks: list[TextBlock],
+        sheets: list[Any],
+        *,
+        source_lang: str = "auto",
+        target_lang: str = "pt-BR",
+        glossary: Optional[dict[str, str]] = None,
+        style: str = "scanlation",
+    ) -> tuple[list[TextBlock], Optional[QuotaSnapshot]]:
+        """Read + translate all numbered cells on 1+ Vision Grid sheets in ONE multimodal Gemini call.
+
+        Cells returned as `""` (or omitted because they are noise/SFX/non-dialogue) keep
+        `translated_text = ""` so post-translation inpainting leaves original artwork 100% intact!
+        """
+        if not blocks or not sheets:
+            return blocks, self.quota_tracker.snapshot(self.model)
+
+        from google.genai import types
+
+        id_list = [str(b.id) for b in blocks]
+        glossary_section = _format_glossary_section(glossary)
+        sheet_note = (
+            f"Sao {len(sheets)} folhas sequenciais da mesma tira/pagina (numeracao continua [1]..[{blocks[-1].id}])."
+            if len(sheets) > 1
+            else f"Grade com {len(blocks)} celulas numeradas [1]..[{blocks[-1].id}]."
+        )
+        lang_hint = (
+            "detecte automaticamente o idioma (Coreano, Chines horizontal/vertical, Japones, Ingles, Espanhol ou Frances)"
+            if source_lang == "auto"
+            else f"idioma de origem provavel: {source_lang}"
+        )
+        prompt_text = (
+            f"{sheet_note} ({lang_hint} -> {target_lang}).{glossary_section}\n"
+            f"IDs presentes: {', '.join(id_list)}.\n"
+            'Retorne APENAS JSON enxuto no formato exato {"1": "FALA", "2": ""} '
+            '(retorne "" para celulas sem dialogo legivel, ruído ou SFX decorativo):'
+        )
+
+        contents: list[Any] = [prompt_text]
+        for sheet in sheets:
+            if len(sheets) > 1:
+                contents.append(f"Folha {sheet.sheet_index}/{sheet.total_sheets}:")
+            contents.append(
+                types.Part.from_bytes(data=sheet.image_bytes, mime_type=sheet.mime_type)
+            )
+
+        system_prompt = build_vision_system_prompt(style)
+        temperature = get_style_temperature(style)
+
+        response = self._call_gemini_contents_json(
+            contents=contents,
+            system_prompt=system_prompt,
+            temperature=temperature,
+        )
+        raw_text = (getattr(response, "text", None) or "").strip()
+        by_id = _parse_lean_single_page_json(raw_text, allow_empty=True)
+
+        translated_non_empty: list[TextBlock] = []
+        for block in blocks:
+            val = by_id.get(block.id, "").strip()
+            if val:
+                block.translated_text = _clean_translated_text(val)
+                translated_non_empty.append(block)
+            else:
+                # Explicitly empty or noise/SFX cell -> preserve original art untouched!
+                block.translated_text = ""
+
+        usage = getattr(response, "usage_metadata", None)
+        prompt_tokens = int(getattr(usage, "prompt_token_count", 0) or 0)
+        output_tokens = int(getattr(usage, "candidates_token_count", 0) or 0)
+
+        rep_in, rep_out = self._repair_glued_blocks_if_needed(
+            translated_non_empty,
+            system_prompt=build_system_prompt(style),
+        )
+        prompt_tokens += rep_in
+        output_tokens += rep_out
+
+        quota_snap = self.quota_tracker.record(
+            model=self.model,
+            prompt_tokens=prompt_tokens,
+            output_tokens=output_tokens,
+        )
+        return blocks, quota_snap
+
+    def translate_pages_batch_vision(
+        self,
+        pages_blocks: list[list[TextBlock]],
+        pages_sheets: list[list[Any]],
+        *,
+        source_lang: str = "auto",
+        target_lang: str = "pt-BR",
+        glossary: Optional[dict[str, str]] = None,
+        style: str = "scanlation",
+    ) -> tuple[list[list[TextBlock]], Optional[QuotaSnapshot], list[int]]:
+        """Read + translate up to 3 sequential pages (labeled P0, P1, P2) in ONE multimodal call.
+
+        Any page that was completely omitted from the batch JSON receives a clean isolated
+        `translate_page_vision()` fallback without losing already-translated pages.
+        """
+        non_empty_indices = [
+            i for i, (blks, shs) in enumerate(zip(pages_blocks, pages_sheets)) if blks and shs
+        ]
+        if not non_empty_indices:
+            return pages_blocks, self.quota_tracker.snapshot(self.model), []
+
+        if len(non_empty_indices) == 1:
+            idx = non_empty_indices[0]
+            _, snap = self.translate_page_vision(
+                pages_blocks[idx],
+                pages_sheets[idx],
+                source_lang=source_lang,
+                target_lang=target_lang,
+                glossary=glossary,
+                style=style,
+            )
+            return pages_blocks, snap, []
+
+        from google.genai import types
+
+        glossary_section = _format_glossary_section(glossary)
+        lang_hint = (
+            "detecte automaticamente o idioma (Coreano, Chines horizontal/vertical, Japones, Ingles, Espanhol ou Frances)"
+            if source_lang == "auto"
+            else f"idioma de origem: {source_lang}"
+        )
+        page_specs = [
+            f"p{idx} (IDs 1..{len(pages_blocks[idx])})"
+            for idx in non_empty_indices
+        ]
+        prompt_text = (
+            f"Lote sequencial de {len(non_empty_indices)} paginas vizinhas do mesmo capitulo "
+            f"({lang_hint} -> {target_lang}). Mantenha continuidade de dialogo.{glossary_section}\n"
+            f"Paginas no lote: {', '.join(page_specs)}.\n"
+            'Retorne APENAS JSON enxuto no formato exato {"p0": {"1": "FALA", "2": ""}, "p1": {"1": "FALA"}} '
+            '(retorne "" para celulas sem dialogo legivel, ruído ou SFX decorativo):'
+        )
+
+        contents: list[Any] = [prompt_text]
+        for idx in non_empty_indices:
+            for sheet in pages_sheets[idx]:
+                contents.append(f"=== Pagina p{idx} (rotulo P{idx}, folha {sheet.sheet_index}/{sheet.total_sheets}) ===")
+                contents.append(
+                    types.Part.from_bytes(data=sheet.image_bytes, mime_type=sheet.mime_type)
+                )
+
+        system_prompt = build_vision_system_prompt(style)
+        temperature = get_style_temperature(style)
+
+        response = self._call_gemini_contents_json(
+            contents=contents,
+            system_prompt=system_prompt,
+            temperature=temperature,
+        )
+        raw_text = (getattr(response, "text", None) or "").strip()
+        try:
+            parsed_batch = _parse_lean_batch_json(raw_text)
+        except InvalidJSONResponseError as parse_exc:
+            parsed_batch = _recover_valid_pages_from_corrupt_batch_json(raw_text)
+            logger.warning(
+                "JSON de lote Vision corrompido/truncado (%s); paginas recuperadas=%s — "
+                "acionando fallback isolado apenas para as demais.",
+                parse_exc,
+                sorted(parsed_batch.keys()),
+            )
+
+        usage = getattr(response, "usage_metadata", None)
+        prompt_tokens = int(getattr(usage, "prompt_token_count", 0) or 0)
+        output_tokens = int(getattr(usage, "candidates_token_count", 0) or 0)
+
+        fallback_pages: list[int] = []
+        all_translated_ok: list[TextBlock] = []
+
+        for idx in non_empty_indices:
+            # Accept both lowercase `p0` and uppercase `P0` keys defensively (preserving `{}`!)
+            page_map = parsed_batch.get(f"p{idx}")
+            if page_map is None:
+                page_map = parsed_batch.get(f"P{idx}")
+            if page_map is None:
+                logger.warning(
+                    "Lote Vision omitiu/corrompeu pagina p%d; acionando fallback isolado.", idx
+                )
+                fallback_pages.append(idx)
+                continue
+
+            for blk in pages_blocks[idx]:
+                val = page_map.get(blk.id, "").strip()
+                if val:
+                    blk.translated_text = _clean_translated_text(val)
+                    all_translated_ok.append(blk)
+                else:
+                    blk.translated_text = ""
+
+        rep_in, rep_out = self._repair_glued_blocks_if_needed(
+            all_translated_ok,
+            system_prompt=build_system_prompt(style),
+        )
+        prompt_tokens += rep_in
+        output_tokens += rep_out
+
+        quota_snap = self.quota_tracker.record(
+            model=self.model,
+            prompt_tokens=prompt_tokens,
+            output_tokens=output_tokens,
+        )
+
+        for idx in fallback_pages:
+            _, quota_snap = self.translate_page_vision(
+                pages_blocks[idx],
+                pages_sheets[idx],
+                source_lang=source_lang,
+                target_lang=target_lang,
+                glossary=glossary,
+                style=style,
+            )
+
+        return pages_blocks, quota_snap, fallback_pages
 
     def list_available_free_models(self) -> list[str]:
         from poc.config import FREE_TIER_MODELS

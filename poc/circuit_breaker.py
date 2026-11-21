@@ -292,6 +292,15 @@ class CircuitBreaker:
         with self._lock:
             return list(self._sleep_history)
 
+    def time_until_recovery(self) -> float:
+        """Seconds remaining until an OPEN circuit transitions to HALF_OPEN (0.0 otherwise)."""
+        with self._lock:
+            self._maybe_transition_open_to_half_open()
+            if self._state != CircuitState.OPEN or self._opened_at is None:
+                return 0.0
+            elapsed = self._clock() - self._opened_at
+            return max(0.0, self.config.recovery_timeout - elapsed)
+
     def reset(self) -> None:
         """Reset circuit breaker back to CLOSED."""
         with self._lock:

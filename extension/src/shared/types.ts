@@ -19,6 +19,12 @@ export const DEFAULT_FREE_MODEL: FreeTierModel = "gemini-3.5-flash-lite";
 /** Bump whenever scanlation translation prompt changes to refresh IndexedDB translations. */
 export const PROMPT_VERSION = "v3-scanlation-turbo" as const;
 
+export type ExtractionMode = "manga_ocr_v1" | "vision_grid_v1";
+
+export function getExtractionModeForLang(lang: SourceLanguage): ExtractionMode {
+  return lang === "ja" ? "manga_ocr_v1" : "vision_grid_v1";
+}
+
 export type TranslationStyle = "scanlation" | "informal" | "fiel" | "formal";
 
 export const SOURCE_LANGUAGES = [

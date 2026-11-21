@@ -3,7 +3,11 @@
  * (no-text) markers keyed by URL + model + style + uppercase for instant chapter reloads.
  */
 
-import { PROMPT_VERSION, type ExtensionSettings } from "../shared/types";
+import {
+  PROMPT_VERSION,
+  getExtractionModeForLang,
+  type ExtensionSettings,
+} from "../shared/types";
 
 const DB_NAME = "scanlator_vogels_cache_v1";
 const STORE_NAME = "translated_pages";
@@ -27,7 +31,8 @@ export function buildCacheKey(
   settings: ExtensionSettings,
   glossaryHash = "g0"
 ): string {
-  return `${PROMPT_VERSION}::${imageUrl}::${settings.sourceLang}::${settings.readingDirection}::${settings.model}::${settings.style}::${settings.uppercase ? "U1" : "U0"}::${glossaryHash}`;
+  const mode = getExtractionModeForLang(settings.sourceLang);
+  return `${PROMPT_VERSION}::${mode}::${imageUrl}::${settings.sourceLang}::${settings.readingDirection}::${settings.model}::${settings.style}::${settings.uppercase ? "U1" : "U0"}::${glossaryHash}`;
 }
 
 export class CacheManager {

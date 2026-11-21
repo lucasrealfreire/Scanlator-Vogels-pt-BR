@@ -774,33 +774,8 @@ class MangaTextRenderer:
             if target_box.width < 12 or target_box.height < 12:
                 continue
 
-            patch = img_rgb[target_box.y1 : target_box.y2, target_box.x1 : target_box.x2]
-            if patch.size > 0:
-                lum_map = (
-                    0.299 * patch[:, :, 0]
-                    + 0.587 * patch[:, :, 1]
-                    + 0.114 * patch[:, :, 2]
-                )
-                lum = float(np.median(lum_map))
-                bg_std = float(np.std(lum_map))
-            else:
-                lum = 255.0
-                bg_std = 0.0
-
-            # True adaptive contrast for colored webtoons, black bubbles, and dark RPG system boxes:
-            # - Dark background (`lum < 128`): crisp white lettering + thin black stroke
-            # - Light/colored background (`lum >= 128`): crisp black lettering + subtle white halo if textured/colored
-            is_dark_bg = lum < 128.0
-            if is_dark_bg:
-                fill_color = (250, 250, 250)
-                stroke_color = (12, 12, 12)
-                use_stroke = True
-            else:
-                fill_color = (18, 18, 18)
-                stroke_color = (252, 252, 252)
-                use_stroke = (not block.is_solid_bubble) or (bg_std >= 14.0)
-
-            layout: Optional[FittedLayout] = None
+            safe_mask: Optional[np.ndarray] = None
+            win: Optional[BoundingBox] = None
             if block.is_solid_bubble:
                 med_bgr = (
                     block.bubble_bg_rgb[2],
@@ -813,19 +788,62 @@ class MangaTextRenderer:
                     blocks,
                     med_bgr,
                 )
-                if safe_mask is not None and win is not None:
-                    contour = _precompute_contour(safe_mask, win)
-                    if contour is not None:
-                        layout = _fit_text_in_contour(
-                            draw,
-                            text,
-                            contour,
-                            self.font_path,
-                            uppercase=self.uppercase,
-                            use_stroke=use_stroke,
-                            min_font_size=min_font,
-                            max_font_size=max_font,
-                        )
+
+            # Sample background luminance STRICTLY inside eroded interior mask (or core 80% of target_box)
+            if safe_mask is not None and win is not None and int(np.count_nonzero(safe_mask)) >= 20:
+                sub_rgb = img_rgb[win.y1 : win.y2, win.x1 : win.x2]
+                bg_pixels = sub_rgb[safe_mask > 0]
+                lum_map = (
+                    0.299 * bg_pixels[:, 0]
+                    + 0.587 * bg_pixels[:, 1]
+                    + 0.114 * bg_pixels[:, 2]
+                )
+                dark_ratio = float(np.mean(lum_map < 95.0))
+                bg_std = float(np.std(lum_map))
+            else:
+                mx = max(0, int(target_box.width * 0.10))
+                my = max(0, int(target_box.height * 0.10))
+                patch = img_rgb[
+                    target_box.y1 + my : max(target_box.y1 + my + 1, target_box.y2 - my),
+                    target_box.x1 + mx : max(target_box.x1 + mx + 1, target_box.x2 - mx),
+                ]
+                if patch.size > 0:
+                    lum_map = (
+                        0.299 * patch[:, :, 0]
+                        + 0.587 * patch[:, :, 1]
+                        + 0.114 * patch[:, :, 2]
+                    )
+                    dark_ratio = float(np.mean(lum_map < 95.0))
+                    bg_std = float(np.std(lum_map))
+                else:
+                    dark_ratio = 0.0
+                    bg_std = 0.0
+
+            # Strict >65% dark pixel threshold: white bubble near dark blackboard stays BLACK text on WHITE!
+            is_dark_bg = dark_ratio > 0.65
+            if is_dark_bg:
+                fill_color = (250, 250, 250)
+                stroke_color = (12, 12, 12)
+                use_stroke = True
+            else:
+                fill_color = (18, 18, 18)
+                stroke_color = (252, 252, 252)
+                use_stroke = (not block.is_solid_bubble) or (bg_std >= 14.0)
+
+            layout: Optional[FittedLayout] = None
+            if safe_mask is not None and win is not None:
+                contour = _precompute_contour(safe_mask, win)
+                if contour is not None:
+                    layout = _fit_text_in_contour(
+                        draw,
+                        text,
+                        contour,
+                        self.font_path,
+                        uppercase=self.uppercase,
+                        use_stroke=use_stroke,
+                        min_font_size=min_font,
+                        max_font_size=max_font,
+                    )
 
             if layout is None:
                 layout = _fit_text_in_rect(

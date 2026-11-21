@@ -161,6 +161,55 @@ class CountingTranslator(TranslatorProvider):
         snap = self.cb.execute(_call)
         return pages_blocks, snap, []
 
+    def translate_page_vision(
+        self,
+        blocks: list[TextBlock],
+        sheets: list,
+        *,
+        source_lang: str = "auto",
+        target_lang: str = "pt-BR",
+        glossary: Optional[dict[str, str]] = None,
+        style: str = "scanlation",
+    ) -> tuple[list[TextBlock], Optional[QuotaSnapshot]]:
+        def _call():
+            self.counter["vision_calls"] = self.counter.get("vision_calls", 0) + 1
+            self.counter["calls"] += 1
+            self.counter["last_glossary"] = glossary
+            self.counter["last_sheets"] = len(sheets)
+            if self.fail_with is not None:
+                raise self.fail_with
+            for b in blocks:
+                b.translated_text = f"Vision ({style}, #{self.counter['calls']})!"
+            return self.tracker.record(self.model, 180, 50)
+
+        snap = self.cb.execute(_call)
+        return blocks, snap
+
+    def translate_pages_batch_vision(
+        self,
+        pages_blocks: list[list[TextBlock]],
+        pages_sheets: list[list],
+        *,
+        source_lang: str = "auto",
+        target_lang: str = "pt-BR",
+        glossary: Optional[dict[str, str]] = None,
+        style: str = "scanlation",
+    ) -> tuple[list[list[TextBlock]], Optional[QuotaSnapshot], list[int]]:
+        def _call():
+            self.counter["vision_batch_calls"] = self.counter.get("vision_batch_calls", 0) + 1
+            self.counter["batch_calls"] = self.counter.get("batch_calls", 0) + 1
+            self.counter["calls"] += 1
+            self.counter["last_glossary"] = glossary
+            if self.fail_with is not None:
+                raise self.fail_with
+            for p_idx, blks in enumerate(pages_blocks):
+                for b in blks:
+                    b.translated_text = f"VisionLote p{p_idx} ({style})!"
+            return self.tracker.record(self.model, 320, 95)
+
+        snap = self.cb.execute(_call)
+        return pages_blocks, snap, []
+
 
 def _build_test_client(
     tmp_path: Path,
@@ -222,15 +271,21 @@ def test_translate_page_multipart_and_retry_reuses_sha256_cache(tmp_path: Path) 
     client, _eng, det, ocr, inp, tr_counter, _ = _build_test_client(tmp_path)
     png = _make_png_bytes(seed=10)
 
-    # First call (multipart): runs detector, OCR, inpainting, translation once
+    # First call (`ja` -> `manga_ocr_v1`): runs detector, OCR, translation, then post-translation inpainting
     r1 = client.post(
         "/translate-page",
         files={"file": ("page1.png", png, "image/png")},
-        data={"model": DEFAULT_FREE_MODEL, "style": "scanlation", "uppercase": "true"},
+        data={
+            "model": DEFAULT_FREE_MODEL,
+            "source_lang": "ja",
+            "style": "scanlation",
+            "uppercase": "true",
+        },
     )
     assert r1.status_code == 200
     d1 = r1.json()
     assert d1["ok"] is True
+    assert d1["extraction_mode"] == "manga_ocr_v1"
     assert d1["no_text"] is False
     assert d1["blocks_count"] == 1
     assert d1["cache_hit_local"] is False
@@ -240,12 +295,13 @@ def test_translate_page_multipart_and_retry_reuses_sha256_cache(tmp_path: Path) 
     assert inp.inpaint_calls == 1
     assert tr_counter["calls"] == 1
 
-    # Retry (`force_retranslate=True`) via Base64 JSON: MUST reuse OCR/inpainting cache!
+    # Retry (`force_retranslate=True`) via Base64 JSON: MUST reuse detection + OCR cache!
     r2 = client.post(
         "/translate-page",
         json={
             "image_base64": base64.b64encode(png).decode("ascii"),
             "model": DEFAULT_FREE_MODEL,
+            "source_lang": "ja",
             "style": "informal",
             "uppercase": False,
             "force_retranslate": True,
@@ -258,8 +314,7 @@ def test_translate_page_multipart_and_retry_reuses_sha256_cache(tmp_path: Path) 
     assert d2["uppercase"] is False
     assert det.detect_calls == 1      # NEVER re-ran detector!
     assert ocr.ocr_calls == 1         # NEVER re-ran OCR!
-    assert inp.inpaint_calls == 1     # NEVER re-ran inpainting!
-    assert tr_counter["calls"] == 2   # Re-ran ONLY translation!
+    assert tr_counter["calls"] == 2   # Re-ran translation!
 
 
 def test_zero_text_page_never_calls_gemini_and_uses_negative_cache(tmp_path: Path) -> None:
@@ -338,8 +393,12 @@ def test_shutdown_unloads_all_models_and_triggers_clean_exit(tmp_path: Path) -> 
     client, _eng, det, ocr, inp, _tr, shutdown_called = _build_test_client(tmp_path)
     png = _make_png_bytes(seed=33)
 
-    # Warm up models first
-    r = client.post("/translate-page", files={"file": ("p.png", png, "image/png")})
+    # Warm up models (`ja` loads detector + manga-ocr + inpainter)
+    r = client.post(
+        "/translate-page",
+        files={"file": ("p.png", png, "image/png")},
+        data={"source_lang": "ja"},
+    )
     assert r.status_code == 200
     assert r.json()["mime_type"] == "image/webp"
     assert not det.unloaded and not ocr.unloaded
@@ -353,32 +412,47 @@ def test_shutdown_unloads_all_models_and_triggers_clean_exit(tmp_path: Path) -> 
     assert inp.unloaded is True
 
 
-def test_prepare_page_preloads_local_cache_without_calling_gemini(tmp_path: Path) -> None:
-    client, _eng, det, ocr, inp, tr_counter, _ = _build_test_client(tmp_path)
+def test_prepare_page_preloads_local_cache_without_calling_gemini_or_inpainting(
+    tmp_path: Path,
+) -> None:
+    client, eng, det, ocr, inp, tr_counter, _ = _build_test_client(tmp_path)
     png = _make_png_bytes(seed=55)
     b64 = base64.b64encode(png).decode("ascii")
 
-    # Pipelined prefetch: /prepare-page runs detect+OCR+inpaint locally, ZERO Gemini calls
+    # Pipelined prefetch: /prepare-page runs detect (+ OCR if `ja`), ZERO inpainting, ZERO Gemini!
     p = client.post("/prepare-page", json={"image_base64": b64, "source_lang": "auto"})
     assert p.status_code == 200
     assert p.json()["ok"] is True
+    assert p.json()["busy_skipped"] is False
+    assert p.json()["extraction_mode"] == "vision_grid_v1"
     assert det.detect_calls == 1
-    assert ocr.ocr_calls == 1
-    assert inp.inpaint_calls == 1
+    assert ocr.ocr_calls == 0       # `auto` uses Vision Grid -> ZERO local RapidOCR!
+    assert inp.inpaint_calls == 0   # Inpainting waits until AFTER translation!
     assert tr_counter["calls"] == 0
 
-    # Subsequent /translate-page hits local SHA-256 cache cleanly and runs ONLY Gemini!
+    # Subsequent /translate-page hits local detection cache, runs Vision Grid + post-translation inpaint!
     t = client.post(
         "/translate-page",
         json={"image_base64": b64, "source_lang": "auto", "output_format": "webp"},
     )
     assert t.status_code == 200
     assert t.json()["cache_hit_local"] is True
+    assert t.json()["extraction_mode"] == "vision_grid_v1"
     assert t.json()["mime_type"] == "image/webp"
     assert det.detect_calls == 1
-    assert ocr.ocr_calls == 1
+    assert ocr.ocr_calls == 0
     assert inp.inpaint_calls == 1
-    assert tr_counter["calls"] == 1
+    assert tr_counter["vision_calls"] == 1
+
+    # Non-blocking guarantee: while an active translation is running, /prepare-page yields immediately!
+    eng._begin_active_translate()
+    try:
+        p_busy = client.post("/prepare-page", json={"image_base64": b64, "source_lang": "auto"})
+        assert p_busy.status_code == 200
+        assert p_busy.json()["busy_skipped"] is True
+        assert det.detect_calls == 1  # Never waited on or touched GPU lock!
+    finally:
+        eng._end_active_translate()
 
 
 def test_translate_batch_groups_multiple_pages_in_one_gemini_call_and_skips_empty_pages(
@@ -522,3 +596,37 @@ def test_direct_ocr_manual_crop_and_glossary_forwarding_and_tall_strip_single_ge
     assert dt["reading_direction"] == "ltr"  # Auto resolved tall Webtoon to LTR!
     assert det2.detect_calls == dt["slices_count"]
     assert tr_counter2["calls"] == 1  # ONE single Gemini call for ALL slices!
+
+
+def test_telemetry_logs_all_stage_timings_on_single_and_batch(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    client, *_ = _build_test_client(tmp_path)
+    png1 = _make_png_bytes(seed=301)
+    png2 = _make_png_bytes(seed=302)
+
+    with caplog.at_level("INFO", logger="backend.engine"):
+        r1 = client.post(
+            "/translate-page",
+            json={"image_base64": base64.b64encode(png1).decode("ascii"), "source_lang": "auto"},
+        )
+        assert r1.status_code == 200
+
+        r2 = client.post(
+            "/translate-batch",
+            json={
+                "pages": [
+                    {"page_id": "p0", "image_base64": base64.b64encode(png1).decode("ascii")},
+                    {"page_id": "p1", "image_base64": base64.b64encode(png2).decode("ascii")},
+                ],
+                "source_lang": "auto",
+            },
+        )
+        assert r2.status_code == 200
+
+    joined = "\n".join(rec.getMessage() for rec in caplog.records)
+    assert "[telemetry] /translate-page" in joined
+    assert "[telemetry] /translate-batch" in joined
+    for key in ("decode_ms=", "detect_ms=", "ocr_or_grid_ms=", "gemini_ms=", "inpaint_ms=", "render_encode_ms=", "total_ms="):
+        assert key in joined, f"Missing telemetry field {key}"

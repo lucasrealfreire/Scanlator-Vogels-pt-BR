@@ -24,7 +24,7 @@ export class TranslationQueue {
     activeCount: number,
     chapterActive: boolean
   ) => void;
-  private readonly maxBatchSize: number;
+  private maxBatchSize: number;
 
   private queue: QueueTask[] = [];
   private activeUrls = new Set<string>();
@@ -37,12 +37,16 @@ export class TranslationQueue {
     singleWorkerFn: (task: QueueTask, nextTasks: QueueTask[]) => Promise<void>,
     batchWorkerFn: (tasks: QueueTask[], nextTasks: QueueTask[]) => Promise<void>,
     onQueueStateChange: (pending: number, activeCount: number, chapterActive: boolean) => void,
-    maxBatchSize = 4
+    maxBatchSize = 3
   ) {
     this.singleWorkerFn = singleWorkerFn;
     this.batchWorkerFn = batchWorkerFn;
     this.onQueueStateChange = onQueueStateChange;
     this.maxBatchSize = Math.max(1, Math.min(4, maxBatchSize));
+  }
+
+  setMaxBatchSize(size: number): void {
+    this.maxBatchSize = Math.max(1, Math.min(4, Math.round(size)));
   }
 
   enqueue(page: DetectedMangaPage, priority: number, forceRetranslate = false): void {

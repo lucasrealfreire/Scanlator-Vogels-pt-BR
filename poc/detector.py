@@ -318,15 +318,29 @@ def resolve_reading_direction(
     if img_w > 0 and img_h > int(round(img_w * 2.2)):
         return "ltr"
 
-    lang = (detected_lang or "ja").strip().lower()
+    lang = (detected_lang or "auto").strip().lower()
     if lang in {"ko", "en", "es", "fr", "latin"}:
         return "ltr"
     if lang == "ja":
         return "rtl"
-    if lang in {"zh", "zh_tw"}:
+    if lang in {"zh", "zh_tw", "auto"}:
         if blocks:
-            vert = sum(1 for b in blocks if b.is_vertical)
-            return "rtl" if (vert * 2 >= len(blocks)) else "ltr"
+            vert_votes = 0
+            for b in blocks:
+                if b.lines:
+                    ratios = []
+                    for poly in b.lines:
+                        if len(poly) >= 3:
+                            xs = [pt[0] for pt in poly]
+                            ys = [pt[1] for pt in poly]
+                            ratios.append(max(1.0, float(max(xs) - min(xs))) / max(1.0, float(max(ys) - min(ys))))
+                    if ratios:
+                        if float(np.median(ratios)) <= 0.80:
+                            vert_votes += 1
+                        continue
+                if b.is_vertical:
+                    vert_votes += 1
+            return "rtl" if (vert_votes * 2 >= len(blocks)) else "ltr"
         return "rtl"
     return "rtl"
 
